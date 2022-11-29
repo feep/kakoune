@@ -446,9 +446,9 @@ TerminalUI::TerminalUI()
 
         while (auto key = get_next_key())
         {
-            if (key == ctrl('z'))
-                kill(0, SIGTSTP); // We suspend at this line
-            else
+        //     if (key == ctrl('z'))
+        //         kill(0, SIGTSTP); // We suspend at this line
+        //     else
                 m_on_key(*key);
         }
       }},
