@@ -92,8 +92,7 @@ bool Client::process_pending_inputs()
         try
         {
             if (debug_keys)
-                write_to_debug_buffer(format("Client '{}' got key '{}'",
-                                             context().name(), key_to_str(key)));
+                write_to_debug_buffer(format("Client '{}' got key '{}'", context().name(), key));
 
             if (key == Key::FocusIn)
                 context().hooks().run_hook(Hook::FocusIn, context().name(), context());
@@ -102,7 +101,7 @@ bool Client::process_pending_inputs()
             else
                 m_input_handler.handle_key(key);
 
-            context().hooks().run_hook(Hook::RawKey, key_to_str(key), context());
+            context().hooks().run_hook(Hook::RawKey, to_string(key), context());
         }
         catch (Kakoune::runtime_error& error)
         {
@@ -170,7 +169,7 @@ DisplayLine Client::generate_mode_line() const
     return modeline;
 }
 
-void Client::change_buffer(Buffer& buffer)
+void Client::change_buffer(Buffer& buffer, Optional<FunctionRef<void()>> set_selections)
 {
     if (m_buffer_reload_dialog_opened)
         close_buffer_reload_dialog();
@@ -181,12 +180,20 @@ void Client::change_buffer(Buffer& buffer)
     m_window->options().unregister_watcher(*this);
     m_window->set_client(nullptr);
     client_manager.add_free_window(std::move(m_window),
-                                   std::move(context().selections()));
+                                   context().selections());
 
     m_window = std::move(ws.window);
     m_window->set_client(this);
     m_window->options().register_watcher(*this);
-    context().selections_write_only() = std::move(ws.selections);
+
+    if (set_selections)
+        (*set_selections)();
+    else
+    {
+        ScopedSelectionEdition selection_edition{context()};
+        context().selections_write_only() = std::move(ws.selections);
+    }
+
     context().set_window(*m_window);
 
     m_window->set_dimensions(m_ui->dimensions());
@@ -327,7 +334,7 @@ void Client::on_buffer_reload_key(Key key)
     }
     else
     {
-        print_status({ format("'{}' is not a valid choice", key_to_str(key)),
+        print_status({ format("'{}' is not a valid choice", key),
                        context().faces()["Error"] });
         m_input_handler.on_next_key("buffer-reload", KeymapMode::None, [this](Key key, Context&){ on_buffer_reload_key(key); });
         return;

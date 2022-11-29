@@ -17,11 +17,7 @@ define-command screen-terminal-impl -hidden -params 3.. %{
         # see x11.kak for what this achieves
         args=$(
             for i in "$@"; do
-                if [ "$i" = '' ]; then
-                    printf "'' "
-                else
-                    printf %s "$i" | sed -e "s|'|'\\\\''|g; s|^|'|; s|$|' |"
-                fi
+                printf "'%s' " "$(printf %s "$i" | sed "s|'|'\\\\''|g")"
             done
         )
         screen -X screen sh -c "${args} ; screen -X remove" < "/dev/$tty"
@@ -72,7 +68,7 @@ If no client is passed then the current one is used' \
         fi
     }
 }
-complete-command screen-focus client 
+complete-command -menu screen-focus client 
 
 alias global focus screen-focus
 alias global terminal screen-terminal-vertical

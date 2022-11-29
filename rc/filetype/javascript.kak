@@ -5,7 +5,7 @@ hook global BufCreate .*[.][cm]?(js)x? %{
     set-option buffer filetype javascript
 }
 
-hook global BufCreate .*[.](ts)x? %{
+hook global BufCreate .*[.][cm]?(ts)x? %{
     set-option buffer filetype typescript
 }
 
@@ -99,7 +99,7 @@ define-command -hidden javascript-insert-on-new-line %<
         # trim trailing whitespace on the previous line
         try %[ execute-keys -draft s\h+$<ret> d ]
         # align the new star with the previous one
-        execute-keys Kx1s^[^*]*(\*)<ret>&
+        execute-keys Kx1s^[^*]*(\*)<ret><a-(><a-&>
     ]
     >
 >
