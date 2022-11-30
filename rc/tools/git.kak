@@ -181,39 +181,39 @@ define-command -params 1.. \
                     if ($from_count == 0 and $to_count > 0) {
                         for $i (0..$to_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{green\}+";
+                            $flags .= " $line|\{green\}▋";
                         }
                     }
                     elsif ($from_count > 0 and $to_count == 0) {
                         if ($to_line == 0) {
-                            $flags .= " 1|\{red\}‾";
+                            $flags .= " 1|\{red\}🬿";
                         } else {
-                            $flags .= " $to_line|\{red\}_";
+                            $flags .= " $to_line|\{red\}🭚";
                         }
                     }
                     elsif ($from_count > 0 and $from_count == $to_count) {
                         for $i (0..$to_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{blue\}~";
+                            $flags .= " $line|\{blue\}▋";
                         }
                     }
                     elsif ($from_count > 0 and $from_count < $to_count) {
                         for $i (0..$from_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{blue\}~";
+                            $flags .= " $line|\{blue\}▋";
                         }
                         for $i ($from_count..$to_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{green\}+";
+                            $flags .= " $line|\{green\}▋";
                         }
                     }
                     elsif ($to_count > 0 and $from_count > $to_count) {
                         for $i (0..$to_count - 2) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{blue\}~";
+                            $flags .= " $line|\{blue\}▋";
                         }
                         $last = $to_line + $to_count - 1;
-                        $flags .= " $last|\{blue+u\}~";
+                        $flags .= " $last|\{blue}▋";
                     }
                 }
             }
