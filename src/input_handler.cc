@@ -1429,8 +1429,10 @@ public:
 
         context().hooks().run_hook(Hook::InsertKey, to_string(key), context());
         if (moved)
+        {
+            m_auto_complete = false;
             context().hooks().run_hook(Hook::InsertMove, to_string(key), context());
-
+        }
         if (update_completions and enabled() and not transient) // Hooks might have disabled us
             m_idle_timer.set_next_date(Clock::now() + get_idle_timeout(context()));
     }
