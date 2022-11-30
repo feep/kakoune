@@ -970,16 +970,7 @@ public:
         }
         else if (key == ctrl('o'))
         {
-            m_explicit_completer = PromptCompleter{};
-            m_auto_complete = not m_auto_complete;
-
-            if (m_auto_complete)
-                refresh_completions(CompletionFlags::Fast);
-            else if (context().has_client())
-            {
-                clear_completions();
-                context().client().menu_hide();
-            }
+            m_auto_complete = false;
         }
         else if (key == alt('!'))
         {
@@ -1397,8 +1388,7 @@ public:
         }
         else if (key == ctrl('o'))
         {
-            m_auto_complete = not m_auto_complete;
-            m_completer.reset();
+            m_auto_complete = false;
         }
         else if (key == ctrl('u'))
         {
