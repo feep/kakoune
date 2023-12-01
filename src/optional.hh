@@ -57,8 +57,6 @@ public:
                (not m_valid or m_value == other.m_value);
     }
 
-    bool operator!=(const Optional& other) const { return !(*this == other); }
-
     template<typename... Args>
     T& emplace(Args&&... args)
     {
@@ -95,7 +93,7 @@ public:
     template<typename U> using DecayOptional = typename DecayOptionalImpl<U>::Type;
 
     template<typename F>
-    auto map(F f) -> Optional<DecayOptional<decltype(f(std::declval<T&&>()))>>
+    auto map(F f) -> Optional<DecayOptional<decltype(f(std::declval<T>()))>>
     {
         if (not m_valid)
             return {};

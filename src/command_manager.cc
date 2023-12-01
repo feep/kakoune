@@ -8,6 +8,7 @@
 #include "file.hh"
 #include "optional.hh"
 #include "option_types.hh"
+#include "profile.hh"
 #include "ranges.hh"
 #include "regex.hh"
 #include "register_manager.hh"
@@ -88,6 +89,13 @@ void CommandManager::load_module(StringView module_name, Context& context)
     module->value.state = Module::State::Loaded;
 
     context.hooks().run_hook(Hook::ModuleLoaded, module_name, context);
+}
+
+HashSet<String> CommandManager::loaded_modules() const
+{
+    return m_modules | filter([](auto&& elem) { return elem.value.state == Module::State::Loaded; })
+                     | transform([](auto&& elem) { return elem.key; })
+                     | gather<HashSet<String>>();
 }
 
 struct parse_error : runtime_error
@@ -213,6 +221,8 @@ Token::Type token_type(StringView type_name, bool throw_on_invalid)
         return Token::Type::ArgExpand;
     else if (type_name == "file")
         return Token::Type::FileExpand;
+    else if (type_name == "exp")
+        return Token::Type::Expand;
     else if (throw_on_invalid)
         throw parse_error{format("unknown expand '{}'", type_name)};
     else
@@ -367,7 +377,7 @@ void expand_token(Token&& token, const Context& context, const ShellContext& she
 
         auto val = ShellManager::instance().get_val(content, context);
         if constexpr (single)
-            return set_target(join(val, false, ' '));
+            return set_target(join(val, ' ', false));
         else
             return set_target(std::move(val));
     }
@@ -389,7 +399,7 @@ void expand_token(Token&& token, const Context& context, const ShellContext& she
     }
     case Token::Type::FileExpand:
         return set_target(read_file(content));
-    case Token::Type::RawEval:
+    case Token::Type::Expand:
         return set_target(expand(content, context, shell_context));
     case Token::Type::Raw:
     case Token::Type::RawQuoted:
@@ -418,7 +428,7 @@ Optional<Token> CommandParser::read_token(bool throw_on_unterminated)
         ParseResult quoted = parse_quoted(m_state, c);
         if (throw_on_unterminated and not quoted.terminated)
             throw parse_error{format("unterminated string {0}...{0}", c)};
-        return Token{c == '"' ? Token::Type::RawEval
+        return Token{c == '"' ? Token::Type::Expand
                               : Token::Type::RawQuoted,
                      start - line.begin(), std::move(quoted.content),
                      quoted.terminated};
@@ -516,12 +526,9 @@ void CommandManager::execute_single_command(CommandParameters params,
     if (debug_flags & DebugFlags::Commands)
         write_to_debug_buffer(format("command {}", join(params, ' ')));
 
-    auto profile = on_scope_end([&, start = (debug_flags & DebugFlags::Profile) ? Clock::now() : Clock::time_point{}] {
-        if (not (debug_flags & DebugFlags::Profile))
-            return;
-        auto full = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
-        write_to_debug_buffer(format("command {} took {} us", params[0], full.count()));
-    });
+    ProfileScope profile{debug_flags, [&](std::chrono::microseconds duration) {
+        write_to_debug_buffer(format("command {} took {} us", params[0], duration.count()));
+    }};
 
     command_it->value.func({{params.begin()+1, params.end()}, command_it->value.param_desc},
                            context, shell_context);
@@ -606,7 +613,7 @@ Optional<CommandInfo> CommandManager::command_info(const Context& context, Strin
         {
             if (it->type == Token::Type::Raw or
                 it->type == Token::Type::RawQuoted or
-                it->type == Token::Type::RawEval)
+                it->type == Token::Type::Expand)
                 params.push_back(it->content);
         }
         String helpstr = cmd->value.helper(context, params);
@@ -685,9 +692,9 @@ static Completions complete_expansion(const Context& context, CompletionFlags fl
     }
 }
 
-static Completions complete_raw_eval(const Context& context, CompletionFlags flags,
-                                     StringView prefix, ByteCount start,
-                                     ByteCount cursor_pos, ByteCount pos_in_token)
+static Completions complete_expand(const Context& context, CompletionFlags flags,
+                                        StringView prefix, ByteCount start,
+                                        ByteCount cursor_pos, ByteCount pos_in_token)
 {
     ParseState state{prefix, prefix.begin()};
     while (state)
@@ -712,14 +719,38 @@ static Completions complete_raw_eval(const Context& context, CompletionFlags fla
     return {};
 }
 
-Completions CommandManager::complete(const Context& context,
-                                     CompletionFlags flags,
-                                     StringView command_line,
-                                     ByteCount cursor_pos)
+
+static Completions requote(Completions completions, Token::Type token_type)
+{
+    if (completions.flags & Completions::Flags::Quoted)
+        return completions;
+
+    if (token_type == Token::Type::Raw)
+    {
+        const bool at_token_start = completions.start == 0;
+        for (auto& candidate : completions.candidates)
+        {
+            const StringView to_escape = ";\n \t";
+            if ((at_token_start and candidate.substr(0_byte, 1_byte) == "%") or
+                any_of(candidate, [&](auto c) { return contains(to_escape, c); }))
+                candidate = at_token_start ? quote(candidate) : escape(candidate, to_escape, '\\');
+        }
+    }
+    else if (token_type == Token::Type::RawQuoted)
+        completions.flags |= Completions::Flags::Quoted;
+    else
+        kak_assert(false);
+
+    return completions;
+}
+
+Completions CommandManager::Completer::operator()(
+    const Context& context, CompletionFlags flags,
+    StringView command_line, ByteCount cursor_pos)
 {
     auto prefix = command_line.substr(0_byte, cursor_pos);
     CommandParser parser{prefix};
-    const char* cursor = prefix.begin() + (int)cursor_pos;
+    const char* cursor = prefix.begin() + cursor_pos;
     Vector<Token> tokens;
 
     bool is_last_token = true;
@@ -747,29 +778,6 @@ Completions CommandManager::complete(const Context& context,
     if (token.terminated) // do not complete past explicit token close
         return Completions{};
 
-    auto requote = [](Completions completions, Token::Type token_type) {
-        if (completions.flags & Completions::Flags::Quoted)
-            return completions;
-
-        if (token_type == Token::Type::Raw)
-        {
-            const bool at_token_start = completions.start == 0;
-            for (auto& candidate : completions.candidates)
-            {
-                const StringView to_escape = ";\n \t";
-                if ((at_token_start and candidate.substr(0_byte, 1_byte) == "%") or
-                    any_of(candidate, [&](auto c) { return contains(to_escape, c); }))
-                    candidate = at_token_start ? quote(candidate) : escape(candidate, to_escape, '\\');
-            }
-        }
-        else if (token_type == Token::Type::RawQuoted)
-            completions.flags |= Completions::Flags::Quoted;
-        else
-            kak_assert(false);
-
-        return completions;
-    };
-
     const ByteCount start = token.pos;
     const ByteCount pos_in_token = cursor_pos - start;
 
@@ -777,8 +785,10 @@ Completions CommandManager::complete(const Context& context,
     if (tokens.size() == 1 and (token.type == Token::Type::Raw or
                                 token.type == Token::Type::RawQuoted))
     {
-        return offset_pos(requote(complete_command_name(context, prefix), token.type), start);
+        return offset_pos(requote(CommandManager::instance().complete_command_name(context, prefix), token.type), start);
     }
+
+    auto& commands = CommandManager::instance().m_commands;
 
     switch (token.type)
     {
@@ -793,74 +803,83 @@ Completions CommandManager::complete(const Context& context,
     case Token::Type::RawQuoted:
     {
         StringView command_name = tokens.front().content;
-        if (command_name != m_last_complete_command)
-        {
-            m_last_complete_command = command_name.str();
-            flags |= CompletionFlags::Start;
-        }
-
-        auto command_it = m_commands.find(resolve_alias(context, command_name));
-        if (command_it == m_commands.end())
+        auto command_it = commands.find(resolve_alias(context, command_name));
+        if (command_it == commands.end())
             return Completions{};
 
         auto& command = command_it->value;
-
-        const bool has_switches = not command.param_desc.switches.empty();
-        auto is_switch = [=](StringView s) { return has_switches and s.substr(0_byte, 1_byte) == "-"; };
-
-        if (is_switch(token.content)
-            and not contains(tokens | drop(1) | transform(&Token::content), "--"))
+        if (command_name != m_last_complete_command)
         {
-            auto switches = Kakoune::complete(token.content.substr(1_byte), pos_in_token,
-                                              concatenated(command.param_desc.switches
-                                                               | transform(&SwitchMap::Item::key),
-                                                           ConstArrayView<String>{"-"}));
-            return switches.empty()
-                    ? Completions{}
-                    : Completions{start+1, cursor_pos, std::move(switches), Completions::Flags::Menu};
+            m_last_complete_command = command_name.str();
+            m_command_completer = command.completer;
         }
-        if (not command.completer)
+
+        auto raw_params = tokens | skip(1) | transform(&Token::content) | gather<Vector<String>>();
+        ParametersParser parser{raw_params, command.param_desc, true};
+
+        switch (parser.state())
+        {
+            case ParametersParser::State::Switch:
+            {
+                auto switches = Kakoune::complete(token.content.substr(1_byte), pos_in_token,
+                                                  concatenated(command.param_desc.switches
+                                                                   | transform(&SwitchMap::Item::key)
+                                                                   | filter([&](const auto& key) {
+                                                                       return not parser.get_switch(key);
+                                                                   }),
+                                                               ConstArrayView<String>{"-"}));
+                return switches.empty()
+                        ? Completions{}
+                        : Completions{start+1, cursor_pos, std::move(switches), Completions::Flags::Menu};
+            }
+            case ParametersParser::State::SwitchArgument:
+            {
+                const auto& switch_desc = command.param_desc.switches.get(raw_params.at(raw_params.size() - 2).substr(1_byte));
+                if (not *switch_desc.arg_completer)
+                    return Completions{};
+                return offset_pos(requote((*switch_desc.arg_completer)(context, flags, raw_params.back(), pos_in_token), token.type), start);
+            }
+            case ParametersParser::State::Positional:
+                break;
+        }
+
+        if (not m_command_completer)
             return Completions{};
 
-        auto params = tokens | skip(1) | transform(&Token::content) | filter(std::not_fn(is_switch)) | gather<Vector>();
+        Vector<String> params{parser.begin(), parser.end()};
         auto index = params.size() - 1;
 
-        return offset_pos(requote(command.completer(context, flags, params, index, pos_in_token), token.type), start);
+        return offset_pos(requote(m_command_completer(context, flags, params, index, pos_in_token), token.type), start);
     }
-    case Token::Type::RawEval:
-        return complete_raw_eval(context, flags, token.content, start, cursor_pos, pos_in_token);
+    case Token::Type::Expand:
+        return complete_expand(context, flags, token.content, start, cursor_pos, pos_in_token);
     default:
         break;
     }
     return Completions{};
 }
 
-Completions CommandManager::complete(const Context& context,
-                                     CompletionFlags flags,
-                                     CommandParameters params,
-                                     size_t token_to_complete,
-                                     ByteCount pos_in_token)
+Completions CommandManager::NestedCompleter::operator()(
+    const Context& context, CompletionFlags flags, CommandParameters params,
+    size_t token_to_complete, ByteCount pos_in_token)
 {
     StringView prefix = params[token_to_complete].substr(0, pos_in_token);
-
     if (token_to_complete == 0)
-        return complete_command_name(context, prefix);
-    else
-    {
-        StringView command_name = params[0];
-        if (command_name != m_last_complete_command)
-        {
-            m_last_complete_command = command_name.str();
-            flags |= CompletionFlags::Start;
-        }
+        return CommandManager::instance().complete_command_name(context, prefix);
 
-        auto command_it = m_commands.find(resolve_alias(context, command_name));
-        if (command_it != m_commands.end() and command_it->value.completer)
-            return command_it->value.completer(
-                context, flags, params.subrange(1),
-                token_to_complete-1, pos_in_token);
+    StringView command_name = params[0];
+    auto& commands = CommandManager::instance().m_commands;
+    if (command_name != m_last_complete_command)
+    {
+        m_last_complete_command = command_name.str();
+        auto it = commands.find(resolve_alias(context, command_name));
+        if (it != commands.end())
+            m_command_completer = it->value.completer;
     }
-    return Completions{};
+
+    return m_command_completer
+        ? m_command_completer(context, flags, params.subrange(1), token_to_complete-1, pos_in_token)
+        : Completions{};
 }
 
 UnitTest test_command_parsing{[]

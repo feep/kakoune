@@ -31,6 +31,8 @@ enum class CharacterType : unsigned char
 };
 constexpr bool with_bit_ops(Meta::Type<CharacterType>) { return true; }
 
+bool is_ctype(CharacterType ctype, Codepoint cp);
+
 struct CharacterClass
 {
     struct Range
@@ -45,10 +47,24 @@ struct CharacterClass
     bool ignore_case = false;
 
     friend bool operator==(const CharacterClass&, const CharacterClass&) = default;
-};
 
-bool is_character_class(const CharacterClass& character_class, Codepoint cp);
-bool is_ctype(CharacterType ctype, Codepoint cp);
+    bool matches(Codepoint cp) const
+    {
+        if (ignore_case)
+            cp = to_lower(cp);
+
+        for (auto& range : ranges)
+        {
+            if (cp < range.min)
+                break;
+            else if (cp <= range.max)
+                return not negative;
+        }
+
+        return (ctypes != CharacterType::None and is_ctype(ctypes, cp)) != negative;
+    }
+
+};
 
 struct CompiledRegex : RefCountable, UseMemoryDomain<MemoryDomain::Regex>
 {
@@ -112,12 +128,12 @@ struct CompiledRegex : RefCountable, UseMemoryDomain<MemoryDomain::Regex>
     struct Instruction
     {
         Op op;
-        // Those mutables are used during execution
-        mutable bool scheduled;
-        mutable uint16_t last_step;
+        mutable uint16_t last_step; // mutable as used during execution
         Param param;
     };
+#ifndef __ppc__
     static_assert(sizeof(Instruction) == 8);
+#endif
 
     explicit operator bool() const { return not instructions.empty(); }
 
@@ -199,6 +215,7 @@ template<typename It>
 struct SentinelType<It, void_t<typename It::Sentinel>> { using Type = typename It::Sentinel; };
 
 template<typename Iterator, RegexMode mode>
+    requires (has_direction(mode))
 class ThreadedRegexVM
 {
 public:
@@ -229,22 +246,24 @@ public:
               const Iterator& subject_begin, const Iterator& subject_end,
               RegexExecFlags flags)
     {
+        return exec(begin, end, subject_begin, subject_end, flags, []{});
+    }
+
+    bool exec(const Iterator& begin, const Iterator& end,
+              const Iterator& subject_begin, const Iterator& subject_end,
+              RegexExecFlags flags, auto&& idle_func)
+    {
         if (flags & RegexExecFlags::NotInitialNull and begin == end)
             return false;
 
         constexpr bool search = (mode & RegexMode::Search);
-
-        ConstArrayView<CompiledRegex::Instruction> instructions{m_program.instructions};
-        instructions = forward ? instructions.subrange(0, m_program.first_backward_inst)
-                               : instructions.subrange(m_program.first_backward_inst);
 
         const ExecConfig config{
             Sentinel{forward ? begin : end},
             Sentinel{forward ? end : begin},
             Sentinel{subject_begin},
             Sentinel{subject_end},
-            flags,
-            instructions
+            flags
         };
 
         Iterator start = forward ? begin : end;
@@ -264,7 +283,7 @@ public:
             }
         }
 
-        return exec_program(std::move(start), config);
+        return exec_program(std::move(start), config, idle_func);
     }
 
     ArrayView<const Iterator> captures() const
@@ -338,20 +357,16 @@ private:
         const Sentinel subject_begin;
         const Sentinel subject_end;
         const RegexExecFlags flags;
-        ConstArrayView<CompiledRegex::Instruction> instructions;
     };
 
     // Steps a thread until it consumes the current character, matches or fail
     [[gnu::always_inline]]
-    void step_thread(const Iterator& pos, uint16_t current_step, Thread thread, const ExecConfig& config)
+    void step_thread(const Iterator& pos, Codepoint cp, uint16_t current_step, Thread thread, const ExecConfig& config)
     {
         auto failed = [this, &thread]() {
             release_saves(thread.saves);
         };
         auto consumed = [this, &thread]() {
-            if (m_program.instructions[thread.inst].scheduled)
-                return release_saves(thread.saves);
-            m_program.instructions[thread.inst].scheduled = true;
             m_threads.push_next(thread);
         };
 
@@ -382,14 +397,13 @@ private:
                     return;
                 case CompiledRegex::Literal:
                     if (pos != config.end and
-                        inst.param.literal.codepoint == (inst.param.literal.ignore_case ? to_lower(codepoint(pos, config))
-                                                                                        : codepoint(pos, config)))
+                        inst.param.literal.codepoint == (inst.param.literal.ignore_case ? to_lower(cp) : cp))
                         return consumed();
                     return failed();
                 case CompiledRegex::AnyChar:
                     return consumed();
                 case CompiledRegex::AnyCharExceptNewLine:
-                    if (pos != config.end and codepoint(pos, config) != '\n')
+                    if (pos != config.end and cp != '\n')
                         return consumed();
                     return failed();
                 case CompiledRegex::Jump:
@@ -422,13 +436,11 @@ private:
                 case CompiledRegex::CharClass:
                     if (pos == config.end)
                         return failed();
-                    return is_character_class(m_program.character_classes[inst.param.character_class_index], codepoint(pos, config)) ?
-                        consumed() : failed();
+                    return m_program.character_classes[inst.param.character_class_index].matches(cp) ? consumed() : failed();
                 case CompiledRegex::CharType:
                     if (pos == config.end)
                         return failed();
-                    return is_ctype(inst.param.character_type, codepoint(pos, config)) ?
-                        consumed() : failed();
+                    return is_ctype(inst.param.character_type, cp) ? consumed() : failed();
                 case CompiledRegex::LineAssertion:
                     if (not (inst.param.line_start ? is_line_start(pos, config) : is_line_end(pos, config)))
                         return failed();
@@ -450,12 +462,12 @@ private:
         return failed();
     }
 
-    bool exec_program(Iterator pos, const ExecConfig& config)
+    bool exec_program(Iterator pos, const ExecConfig& config, auto&& idle_func)
     {
         kak_assert(m_threads.current_is_empty() and m_threads.next_is_empty());
         release_saves(m_captures);
         m_captures = -1;
-        m_threads.grow_ifn();
+        m_threads.ensure_initial_capacity();
 
         const int16_t first_inst = forward ? 0 : m_program.first_backward_inst;
         m_threads.push_current({first_inst, -1});
@@ -470,36 +482,38 @@ private:
         {
             if (++current_step == 0)
             {
+                idle_func();
+
                 // We wrapped, avoid potential collision on inst.last_step by resetting them
-                for (auto& inst : config.instructions)
+                ConstArrayView<CompiledRegex::Instruction> instructions{m_program.instructions};
+                instructions = forward ? instructions.subrange(0, m_program.first_backward_inst)
+                                       : instructions.subrange(m_program.first_backward_inst);
+
+                for (auto& inst : instructions)
                     inst.last_step = 0;
                 current_step = 1; // step 0 is never valid
             }
 
-            while (not m_threads.current_is_empty())
-                step_thread(pos, current_step, m_threads.pop_current(), config);
+            auto next = pos;
+            Codepoint cp = pos != config.end ? codepoint(next, config) : -1;
 
-            for (auto& thread : m_threads.next_threads())
-                m_program.instructions[thread.inst].scheduled = false;
+            while (not m_threads.current_is_empty())
+                step_thread(pos, cp, current_step, m_threads.pop_current(), config);
 
             if (pos == config.end or
                 (m_threads.next_is_empty() and (not search or m_found_match)) or
                 (m_found_match and any_match))
             {
-                for (auto& t : m_threads.next_threads())
-                    release_saves(t.saves);
-                m_threads.clear_next();
+                while (not m_threads.next_is_empty())
+                    release_saves(m_threads.pop_next().saves);
                 return m_found_match;
             }
 
-            forward ? utf8::to_next(pos, config.subject_end)
-                    : utf8::to_previous(pos, config.subject_begin);
-
+            pos = next;
             if (search and not m_found_match)
             {
                 if (start_desc and m_threads.next_is_empty())
                     to_next_start(pos, config, *start_desc);
-                m_threads.grow_ifn();
                 m_threads.push_next({first_inst, -1});
             }
             m_threads.swap_next();
@@ -560,7 +574,7 @@ private:
             else if (op >= Lookaround::CharacterClass and op < Lookaround::CharacterType)
             {
                 auto index = to_underlying(op) - to_underlying(Lookaround::CharacterClass);
-                if (not is_character_class(m_program.character_classes[index], cp))
+                if (not m_program.character_classes[index].matches(cp))
                     return false;
             }
             else if (op >= Lookaround::CharacterType and op < Lookaround::OpEnd)
@@ -605,72 +619,92 @@ private:
                is_word(utf8::codepoint(pos, config.subject_end));
     }
 
-    static Codepoint codepoint(const Iterator& it, const ExecConfig& config)
+    static Codepoint codepoint(Iterator& it, const ExecConfig& config)
     {
-        return utf8::codepoint(forward ? it : utf8::previous(it, config.subject_begin),
-                               config.subject_end);
+        if constexpr (forward)
+        {
+            return utf8::read_codepoint(it, config.end);
+        }
+        else
+        {
+            utf8::to_previous(it, config.end);
+            return utf8::codepoint(it, config.begin);
+        }
     }
 
     const CompiledRegex& m_program;
 
     struct DualThreadStack
     {
-        DualThreadStack() = default;
-        DualThreadStack(const DualThreadStack&) = delete;
-        DualThreadStack(DualThreadStack&& other)
-          : m_data{other.m_data}, m_capacity{other.m_capacity}, m_current{other.m_current}, m_next{other.m_next}
-        {
-            other.m_data = nullptr;
-        }
-        ~DualThreadStack() { delete[] m_data; }
+        bool current_is_empty() const { return m_current == m_next_begin; }
+        bool next_is_empty() const { return m_next_end == m_next_begin; }
 
-        bool current_is_empty() const { return m_current == 0; }
-        bool next_is_empty() const { return m_next == m_capacity; }
+        void push_current(Thread thread) { m_data[decrement(m_current)] = thread; grow_ifn(true); }
+        Thread pop_current() { return m_data[post_increment(m_current)]; }
 
-        void push_current(Thread thread) { kak_assert(m_current < m_next); m_data[m_current++] = thread; grow_ifn(); }
-        Thread pop_current() { kak_assert(m_current > 0); return m_data[--m_current]; }
-
-        void push_next(Thread thread) { kak_assert(m_current < m_next);  m_data[--m_next] = thread; }
-        void clear_next() { m_next = m_capacity; }
-        ConstArrayView<Thread> next_threads() const { return { m_data + m_next, m_data + m_capacity }; }
+        void push_next(Thread thread) { m_data[post_increment(m_next_end)] = thread; grow_ifn(false); }
+        Thread pop_next() { return m_data[decrement(m_next_end)]; }
 
         void swap_next()
         {
-            kak_assert(m_next < m_capacity);
-            const int32_t count = m_capacity - m_next;
-            std::copy_n(m_data + m_next, count, m_data);
-            m_current = count;
-            m_next = m_capacity;
+            m_current = m_next_begin;
+            m_next_begin = m_next_end;
         }
 
-        void grow_ifn()
+        void ensure_initial_capacity()
         {
-            if (m_current != m_next)
+            if (m_capacity != 0)
                 return;
 
             constexpr int32_t initial_capacity = 64 / sizeof(Thread);
             static_assert(initial_capacity >= 4);
+            m_data.reset(new Thread[initial_capacity]);
+            m_capacity = initial_capacity;
 
-            const auto new_capacity = m_capacity ? m_capacity * 2 : initial_capacity;
-            const auto next_count = m_capacity - m_next;
-            const auto new_next = new_capacity - next_count;
+        }
+
+        void grow_ifn(bool pushed_current)
+        {
+            if (m_current != m_next_end)
+                return;
+
+            const auto new_capacity = m_capacity * 2;
             Thread* new_data = new Thread[new_capacity];
-            std::copy_n(m_data, m_current, new_data);
-            std::copy_n(m_data + m_next, next_count, new_data + new_next);
-            delete[] m_data;
-            m_data = new_data;
+            Thread* old_data = m_data.get();
+            std::rotate_copy(old_data, old_data + m_current, old_data + m_capacity, new_data);
+            m_next_begin -= m_current;
+            if ((pushed_current and m_next_begin == 0) or m_next_begin < 0)
+                m_next_begin += m_capacity;
+            m_next_end = m_capacity;
+            m_current = 0;
+
+            m_data.reset(new_data);
             m_capacity = new_capacity;
-            m_next = new_next;
         }
 
     private:
-        Thread* m_data = nullptr;
+        int32_t decrement(int32_t& index)
+        {
+            if (index == 0)
+                index = m_capacity;
+            return --index;
+        }
+
+        int32_t post_increment(int32_t& index)
+        {
+            auto res = index;
+            if (++index == m_capacity)
+                index = 0;
+            return res;
+        }
+
+        std::unique_ptr<Thread[]> m_data;
         int32_t m_capacity = 0; // Maximum capacity should be 2*instruction count, so 65536
         int32_t m_current = 0;
-        int32_t m_next = 0;
+        int32_t m_next_begin = 0;
+        int32_t m_next_end = 0;
     };
 
-    static_assert(has_direction(mode));
     static constexpr bool forward = mode & RegexMode::Forward;
 
     DualThreadStack m_threads;

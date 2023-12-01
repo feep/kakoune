@@ -27,7 +27,7 @@ The *map* command makes *key* behave as if the *keys* sequence was typed.
         mode entered when a menu is displayed with the 'menu' command
 
     *user*::
-        mode entered when the user prefix is hit (default: ',')
+        mode entered when the user prefix is hit (default: '<space>')
 
     *goto*::
         mode entered when the goto key is hit (default: 'g')
@@ -65,7 +65,7 @@ map global user n :make-next-error<ret>
 If you make a normal-mode mapping, you can prefix it with a count or a register
 name like any other normal-mode key. You can forward this information to the
 command you invoke with the `%val{count}` and `%val{register}` expansions
-(See <<expansions#`:doc expansions`>>). For example:
+(See <<expansions#,`:doc expansions`>>). For example:
 
 ----
 map global normal = ':echo Got count %val{count} and reg %val{register}<ret>'
@@ -73,7 +73,9 @@ map global normal = ':echo Got count %val{count} and reg %val{register}<ret>'
 
 == Mappable keys
 
-See <<keys#,`:doc keys`>> to discover the list of default bindings.
+See <<keys#,`:doc keys`>> to learn what each key does in each mode. The keys on
+the right-hand side of the mapping are not affected by other mappings, they
+always perform their original function.
 
 For *key* and *keys* in the *map* command, the following key names can
 be used:
@@ -143,6 +145,9 @@ NOTE: Although Kakoune allows many key combinations to be mapped, not every
 possible combination can be triggered. For example, due to limitations in
 the way terminals handle control characters, mappings like *<c-s-a>* are
 unlikely to work in Kakoune's terminal UI.
+
+Some keys, like `<c-c>` and `<c-g>`, cannot be remapped because they are
+used to cancel operations. See <<keys#cancelling-operations,`:doc keys cancelling-operations`>>.
 
 == Default mappings
 

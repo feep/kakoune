@@ -27,7 +27,7 @@ String to_json(Color color)
     if (color.color == Kakoune::Color::RGB)
     {
         char buffer[10];
-        sprintf(buffer, R"("#%02x%02x%02x")", color.r, color.g, color.b);
+        format_to(buffer, R"("#{:02}{:02}{:02}")", hex(color.r), hex(color.g), hex(color.b));
         return buffer;
     }
     return to_json(to_string(color));
@@ -38,6 +38,7 @@ String to_json(Attribute attributes)
     struct Attr { Attribute attr; StringView name; }
     attrs[] {
         { Attribute::Underline, "underline" },
+        { Attribute::CurlyUnderline, "curly_underline" },
         { Attribute::Reverse, "reverse" },
         { Attribute::Blink, "blink" },
         { Attribute::Bold, "bold" },
@@ -208,6 +209,11 @@ DisplayCoord JsonUI::dimensions()
 void JsonUI::set_on_key(OnKeyCallback callback)
 {
     m_on_key = std::move(callback);
+}
+
+void JsonUI::set_on_paste(OnPasteCallback callback)
+{
+    m_on_paste = std::move(callback);
 }
 
 void JsonUI::eval_json(const Value& json)

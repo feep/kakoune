@@ -127,94 +127,6 @@ void replace_range(DisplayBuffer& display_buffer,
     func(*first_it, first_atom_it);
 }
 
-void apply_highlighter(HighlightContext context,
-                       DisplayBuffer& display_buffer,
-                       BufferCoord begin, BufferCoord end,
-                       Highlighter& highlighter)
-{
-    if (begin == end)
-        return;
-
-    using LineIterator = DisplayLineList::iterator;
-    LineIterator first_line;
-    Vector<size_t> insert_idx;
-    auto line_end = display_buffer.lines().end();
-
-    DisplayBuffer region_display;
-    auto& region_lines = region_display.lines();
-    for (auto line_it = display_buffer.lines().begin(); line_it != line_end; ++line_it)
-    {
-        auto& line = *line_it;
-        auto& range = line.range();
-        if (range.end <= begin or end <= range.begin)
-            continue;
-
-        if (region_lines.empty())
-            first_line = line_it;
-
-        if (range.begin < begin or range.end > end)
-        {
-            size_t beg_idx = 0;
-            size_t end_idx = line.atoms().size();
-
-            for (auto atom_it = line.begin(); atom_it != line.end(); ++atom_it)
-            {
-                if (not atom_it->has_buffer_range() or end <= atom_it->begin() or begin >= atom_it->end())
-                    continue;
-
-                bool is_replaced = atom_it->type() == DisplayAtom::ReplacedRange;
-                if (atom_it->begin() <= begin)
-                {
-                    if (is_replaced or atom_it->begin() == begin)
-                        beg_idx = atom_it - line.begin();
-                    else
-                    {
-                        atom_it = ++line.split(atom_it, begin);
-                        beg_idx = atom_it - line.begin();
-                        ++end_idx;
-                    }
-                }
-
-                if (atom_it->end() >= end)
-                {
-                    if (is_replaced or atom_it->end() == end)
-                        end_idx = atom_it - line.begin() + 1;
-                    else
-                    {
-                        atom_it = ++line.split(atom_it, end);
-                        end_idx = atom_it - line.begin();
-                    }
-                }
-            }
-            region_lines.emplace_back();
-            std::move(line.begin() + beg_idx, line.begin() + end_idx,
-                      std::back_inserter(region_lines.back()));
-            auto it = line.erase(line.begin() + beg_idx, line.begin() + end_idx);
-            insert_idx.push_back(it - line.begin());
-        }
-        else
-        {
-            insert_idx.push_back(0);
-            region_lines.push_back(std::move(line));
-        }
-    }
-
-    if (region_display.lines().empty())
-        return;
-
-    region_display.compute_range();
-    highlighter.highlight(context, region_display, {begin, end});
-
-    for (size_t i = 0; i < region_lines.size(); ++i)
-    {
-        auto& line = *(first_line + i);
-        auto pos = line.begin() + insert_idx[i];
-        for (auto& atom : region_lines[i])
-            pos = ++line.insert(pos, std::move(atom));
-    }
-    display_buffer.compute_range();
-}
-
 auto apply_face = [](const Face& face)
 {
     return [&face](DisplayAtom& atom) {
@@ -231,13 +143,12 @@ static std::unique_ptr<Highlighter> create_fill_highlighter(HighlighterParameter
     if (params.size() != 1)
         throw runtime_error("wrong parameter count");
 
-    const String& facespec = params[0];
-    auto func = [facespec](HighlightContext context, DisplayBuffer& display_buffer, BufferRange range)
-    {
-        highlight_range(display_buffer, range.begin, range.end, false,
-                        apply_face(context.context.faces()[facespec]));
-    };
-    return make_highlighter(std::move(func));
+    return make_highlighter(
+        [spec=parse_face(params[0])](HighlightContext context, DisplayBuffer& display_buffer,
+                                     BufferRange range) {
+            highlight_range(display_buffer, range.begin, range.end, false,
+                            apply_face(context.context.faces()[spec]));
+        });
 }
 
 template<typename T>
@@ -256,7 +167,7 @@ private:
     ValueId m_id;
 };
 
-using FacesSpec = Vector<std::pair<size_t, String>, MemoryDomain::Highlight>;
+using FacesSpec = Vector<std::pair<size_t, FaceSpec>, MemoryDomain::Highlight>;
 
 const HighlighterDesc regex_desc = {
     "Parameters: <regex> <capture num>:<face> <capture num>:<face>...\n"
@@ -285,7 +196,7 @@ public:
             return;
 
         const auto faces = m_faces | transform([&faces = context.context.faces()](auto&& spec) {
-                return spec.second.empty() ? Face{} : faces[spec.second];
+                return faces[spec.second];
             }) | gather<Vector<Face>>();
 
         const auto& matches = get_matches(context.context.buffer(), display_buffer.range(), range);
@@ -330,7 +241,7 @@ public:
             if (capture < 0)
                 throw runtime_error(format("capture name {} is neither a capture index, nor an existing capture name",
                                            capture_name));
-            faces.emplace_back(capture, String{colon+1, spec.end()});
+            faces.emplace_back(capture, parse_face({colon+1, spec.end()}));
         }
 
         return std::make_unique<RegexHighlighter>(std::move(re), std::move(faces));
@@ -360,11 +271,9 @@ private:
             return;
 
         std::sort(m_faces.begin(), m_faces.end(),
-                  [](const std::pair<size_t, String>& lhs,
-                     const std::pair<size_t, String>& rhs)
-                  { return lhs.first < rhs.first; });
+                  [](auto&& lhs, auto&& rhs) { return lhs.first < rhs.first; });
         if (m_faces[0].first != 0)
-            m_faces.emplace(m_faces.begin(), 0, String{});
+            m_faces.emplace(m_faces.begin(), 0, FaceSpec{});
     }
 
     void add_matches(const Buffer& buffer, MatchList& matches, BufferRange range)
@@ -499,14 +408,14 @@ std::unique_ptr<Highlighter> create_dynamic_regex_highlighter(HighlighterParamet
     if (params.size() < 2)
         throw runtime_error("wrong parameter count");
 
-    Vector<std::pair<String, String>> faces;
+    Vector<std::pair<String, FaceSpec>> faces;
     for (auto& spec : params.subrange(1))
     {
         auto colon = find(spec, ':');
         if (colon == spec.end())
             throw runtime_error("wrong face spec: '" + spec +
                                  "' expected <capture>:<facespec>");
-        faces.emplace_back(String{spec.begin(), colon}, String{colon+1, spec.end()});
+        faces.emplace_back(String{spec.begin(), colon}, parse_face({colon+1, spec.end()}));
     }
 
     auto make_hl = [](auto& regex_getter, auto& face_getter) {
@@ -528,7 +437,7 @@ std::unique_ptr<Highlighter> create_dynamic_regex_highlighter(HighlighterParamet
                                              face.first));
                 return FacesSpec{};
             }
-            spec.emplace_back(capture, face.second);
+            spec.emplace_back(capture, std::move(face.second));
         }
         return spec;
     };
@@ -569,7 +478,7 @@ std::unique_ptr<Highlighter> create_line_highlighter(HighlighterParameters param
     if (params.size() != 2)
         throw runtime_error("wrong parameter count");
 
-    auto func = [line_expr=params[0], facespec=params[1]]
+    auto func = [line_expr=params[0], facespec=parse_face(params[1])]
                 (HighlightContext context, DisplayBuffer& display_buffer, BufferRange)
     {
         LineCount line = -1;
@@ -621,7 +530,7 @@ std::unique_ptr<Highlighter> create_column_highlighter(HighlighterParameters par
     if (params.size() != 2)
         throw runtime_error("wrong parameter count");
 
-    auto func = [col_expr=params[0], facespec=params[1]]
+    auto func = [col_expr=params[0], facespec=parse_face(params[1])]
                 (HighlightContext context, DisplayBuffer& display_buffer, BufferRange)
     {
         ColumnCount column = -1;
@@ -642,7 +551,7 @@ std::unique_ptr<Highlighter> create_column_highlighter(HighlighterParameters par
         if (column < context.setup.first_column or column >= context.setup.first_column + context.context.window().dimensions().column)
             return;
 
-        column += context.setup.widget_columns;
+        column += context.setup.widget_columns - context.setup.first_column;
         for (auto& line : display_buffer.lines())
         {
             auto remaining_col = column;
@@ -678,10 +587,10 @@ const HighlighterDesc wrap_desc = {
     "Parameters: [-word] [-indent] [-width <max_width>] [-marker <marker_text>]\n"
     "Wrap lines to window width",
     { {
-        { "word",   { false, "wrap at word boundaries instead of codepoint boundaries" } },
-        { "indent", { false, "preserve line indentation of the wrapped line" } },
-        { "width",  { true, "wrap at the given column instead of the window's width" } },
-        { "marker", { true, "insert the given text at the beginning of the wrapped line" } }, },
+        { "word",   { {}, "wrap at word boundaries instead of codepoint boundaries" } },
+        { "indent", { {}, "preserve line indentation of the wrapped line" } },
+        { "width",  { ArgCompleter{}, "wrap at the given column instead of the window's width" } },
+        { "marker", { ArgCompleter{}, "insert the given text at the beginning of the wrapped line" } }, },
         ParameterDesc::Flags::None, 0, 0
     }
 };
@@ -843,7 +752,8 @@ struct WrapHighlighter : Highlighter
             win_line += wrap_count + 1;
 
             // scroll window to keep cursor visible, and update range as lines gets removed
-            while (buf_line >= cursor.line and setup.first_line < cursor.line and
+            while (setup.ensure_cursor_visible and
+                   buf_line >= cursor.line and setup.first_line < cursor.line and
                    setup.cursor_pos.line + setup.scroll_offset.line >= win_height)
             {
                 auto remove_count = 1 + line_wrap_count(setup.first_line, indent);
@@ -976,28 +886,50 @@ struct TabulationHighlighter : Highlighter
         const auto& buffer = context.context.buffer();
         for (auto& line : display_buffer.lines())
         {
+            ColumnCount column = 0;
+            const char* line_data = nullptr;
+            const char* pos = nullptr;
             for (auto atom_it = line.begin(); atom_it != line.end(); ++atom_it)
             {
                 if (atom_it->type() != DisplayAtom::Range)
                     continue;
 
-                auto begin = get_iterator(buffer, atom_it->begin());
-                auto end = get_iterator(buffer, atom_it->end());
-                for (BufferIterator it = begin; it != end; ++it)
+                auto begin = atom_it->begin();
+                if (auto* atom_line_data = buffer[begin.line].data(); atom_line_data != line_data)
                 {
-                    if (*it == '\t')
-                    {
-                        if (it != begin)
-                            atom_it = ++line.split(atom_it, it.coord());
-                        if (it+1 != end)
-                            atom_it = line.split(atom_it, (it+1).coord());
+                    pos = line_data = atom_line_data;
+                    column = 0;
+                }
 
-                        const ColumnCount column = get_column(buffer, tabstop, it.coord());
-                        const ColumnCount count = tabstop - (column % tabstop);
-                        atom_it->replace(String{' ', count});
+                kak_assert(pos != nullptr and pos <= line_data + begin.column);
+                for (auto end = line_data + atom_it->end().column; pos != end; ++pos)
+                {
+                    const char* next_tab = std::find(pos, end, '\t');
+                    if (next_tab == end)
+                    {
+                        pos = end;
                         break;
                     }
+
+                    while (pos != next_tab)
+                        column += codepoint_width(utf8::read_codepoint(pos, next_tab));
+                    const ColumnCount tabwidth = tabstop - (column % tabstop);
+                    column += tabwidth;
+
+                    if (pos >= line_data + atom_it->begin().column)
+                    {
+                        if (pos != line_data + atom_it->begin().column)
+                            atom_it = ++line.split(atom_it, {begin.line, ByteCount(pos - line_data)});
+                        if (pos + 1 != end)
+                            atom_it = line.split(atom_it, {begin.line, ByteCount(pos + 1 - line_data)});
+
+                        atom_it->replace(String{' ', tabwidth});
+                        ++atom_it;
+                    }
                 }
+
+                if (atom_it == line.end())
+                    break;
             }
         }
     }
@@ -1025,25 +957,27 @@ const HighlighterDesc show_whitespace_desc = {
     "Parameters: [-tab <separator>] [-tabpad <separator>] [-lf <separator>] [-spc <separator>] [-nbsp <separator>]\n"
     "Display whitespaces using symbols",
     { {
-        { "tab",    { true, "replace tabulations with the given character" } },
-        { "tabpad", { true, "append as many of the given character as is necessary to honor `tabstop`" } },
-        { "spc",    { true, "replace spaces with the given character" } },
-        { "lf",     { true, "replace line feeds with the given character" } },
-        { "nbsp",   { true, "replace non-breakable spaces with the given character" } } },
+        { "tab",    { ArgCompleter{}, "replace tabulations with the given character" } },
+        { "tabpad", { ArgCompleter{}, "append as many of the given character as is necessary to honor `tabstop`" } },
+        { "spc",    { ArgCompleter{}, "replace spaces with the given character" } },
+        { "lf",     { ArgCompleter{}, "replace line feeds with the given character" } },
+        { "nbsp",   { ArgCompleter{}, "replace non-breakable spaces with the given character" } },
+        { "only-trailing", { {}, "only highlighting trailing whitespaces" } } },
         ParameterDesc::Flags::None, 0, 0
     }
 };
 struct ShowWhitespacesHighlighter : Highlighter
 {
-    ShowWhitespacesHighlighter(String tab, String tabpad, String spc, String lf, String nbsp)
+    ShowWhitespacesHighlighter(String tab, String tabpad, String spc, String lf, String nbsp, bool only_trailing)
       : Highlighter{HighlightPass::Move}, m_tab{std::move(tab)}, m_tabpad{std::move(tabpad)},
-        m_spc{std::move(spc)}, m_lf{std::move(lf)}, m_nbsp{std::move(nbsp)}
+        m_spc{std::move(spc)}, m_lf{std::move(lf)}, m_nbsp{std::move(nbsp)}, m_only_trailing{std::move(only_trailing)}
     {}
 
     static std::unique_ptr<Highlighter> create(HighlighterParameters params, Highlighter*)
     {
         ParametersParser parser(params, show_whitespace_desc.params);
 
+        bool only_trailing = (bool) parser.get_switch("only-trailing");
         auto get_param = [&](StringView param,  StringView fallback) {
             StringView value = parser.get_switch(param).value_or(fallback);
             if (value.char_length() != 1)
@@ -1053,7 +987,7 @@ struct ShowWhitespacesHighlighter : Highlighter
 
         return std::make_unique<ShowWhitespacesHighlighter>(
             get_param("tab", "→"), get_param("tabpad", " "), get_param("spc", "·"),
-            get_param("lf", "¬"), get_param("nbsp", "⍽"));
+            get_param("lf", "¬"), get_param("nbsp", "⍽"), only_trailing);
     }
 
 private:
@@ -1071,12 +1005,30 @@ private:
 
                 auto begin = get_iterator(buffer, atom_it->begin());
                 auto end = get_iterator(buffer, atom_it->end());
+                auto last_non_space = begin.coord();
+
+                auto is_whitespace = [](Codepoint cp) {
+                    return cp == '\t' or cp == ' ' or cp == '\n' or cp == 0xA0 or cp == 0x202F;
+                };
+
+                if(m_only_trailing)
+                {
+                    for (BufferIterator it = begin; it != end; )
+                    {
+                        if (not is_whitespace(utf8::read_codepoint(it, end)))
+                            last_non_space = it.coord();
+                    }
+                }
+
                 for (BufferIterator it = begin; it != end; )
                 {
                     auto coord = it.coord();
                     Codepoint cp = utf8::read_codepoint(it, end);
-                    if (cp == '\t' or cp == ' ' or cp == '\n' or cp == 0xA0 or cp == 0x202F)
+                    if (is_whitespace(cp))
                     {
+                        if (m_only_trailing and it.coord() <= last_non_space)
+                            continue;
+
                         if (coord != begin.coord())
                             atom_it = ++line.split(atom_it, coord);
                         if (it != end)
@@ -1103,17 +1055,18 @@ private:
     }
 
     const String m_tab, m_tabpad, m_spc, m_lf, m_nbsp;
+    const bool m_only_trailing;
 };
 
 const HighlighterDesc line_numbers_desc = {
     "Parameters: [-relative] [-hlcursor] [-separators <separator|separator:cursor|cursor:up:down>] [-min-digits <cols>]\n"
     "Display line numbers",
     { {
-        { "relative", { false, "show line numbers relative to the main cursor line" } },
-        { "separator", { true, "string to separate the line numbers column from the rest of the buffer (default '|')" } },
-        { "cursor-separator", { true, "identical to -separator but applies only to the line of the cursor (default is the same value passed to -separator)" } },
-        { "min-digits", { true, "use at least the given number of columns to display line numbers (default 2)" } },
-        { "hlcursor", { false, "highlight the cursor line with a separate face" } } },
+        { "relative", { {}, "show line numbers relative to the main cursor line" } },
+        { "separator", { ArgCompleter{}, "string to separate the line numbers column from the rest of the buffer (default '|')" } },
+        { "cursor-separator", { ArgCompleter{}, "identical to -separator but applies only to the line of the cursor (default is the same value passed to -separator)" } },
+        { "min-digits", { ArgCompleter{}, "use at least the given number of columns to display line numbers (default 2)" } },
+        { "hlcursor", { {}, "highlight the cursor line with a separate face" } } },
         ParameterDesc::Flags::None, 0, 0
     }
 };
@@ -1164,7 +1117,7 @@ private:
         int digit_count = compute_digit_count(context.context);
 
         char format[16];
-        format_to(format, "%{}d", digit_count);
+        format_to(format, "\\{:{}}", digit_count);
         const int main_line = (int)context.context.selections().main().cursor().line + 1;
         int last_line = -1;
         for (auto& line : display_buffer.lines())
@@ -1174,7 +1127,7 @@ private:
             const int line_to_format = (m_relative and not is_cursor_line) ?
                                        current_line - main_line : current_line;
             char buffer[16];
-            snprintf(buffer, 16, format, std::abs(line_to_format));
+            format_to(buffer, format, std::abs(line_to_format));
             const auto atom_face = last_line == current_line ? face_wrapped :
                 ((m_hl_cursor_line and is_cursor_line) ? face_absolute : face);
 
@@ -1223,8 +1176,9 @@ constexpr StringView LineNumbersHighlighter::ms_id;
 
 const HighlighterDesc show_matching_desc = {
     "Apply the MatchingChar face to the char matching the one under the cursor",
-    {}
+    { { { "previous", {} } }, ParameterDesc::Flags::SwitchesOnlyAtStart, 0, 0 }
 };
+template<bool match_prev>
 void show_matching_char(HighlightContext context, DisplayBuffer& display_buffer, BufferRange)
 {
     const Face face = context.context.faces()["MatchingChar"];
@@ -1239,9 +1193,16 @@ void show_matching_char(HighlightContext context, DisplayBuffer& display_buffer,
 
         Utf8Iterator it{buffer.iterator_at(pos), buffer};
         auto match = find(matching_pairs, *it);
+        bool matching_prev = match == matching_pairs.end() and match_prev;
+        if (matching_prev)
+            match = find(matching_pairs, *--it);
 
         if (match == matching_pairs.end())
             continue;
+
+        if (matching_prev)
+            highlight_range(display_buffer, it.base().coord(), (it+1).base().coord(),
+                            false, apply_face(face));
 
         int level = 0;
         if (((match - matching_pairs.begin()) % 2) == 0)
@@ -1285,7 +1246,8 @@ void show_matching_char(HighlightContext context, DisplayBuffer& display_buffer,
 
 std::unique_ptr<Highlighter> create_matching_char_highlighter(HighlighterParameters params, Highlighter*)
 {
-    return make_highlighter(show_matching_char);
+    ParametersParser parser{params, show_matching_desc.params};
+    return make_highlighter(parser.get_switch("previous") ? show_matching_char<true> : show_matching_char<false>);
 }
 
 void highlight_selections(HighlightContext context, DisplayBuffer& display_buffer, BufferRange)
@@ -1324,30 +1286,32 @@ void highlight_selections(HighlightContext context, DisplayBuffer& display_buffe
 void expand_unprintable(HighlightContext context, DisplayBuffer& display_buffer, BufferRange)
 {
     const auto& buffer = context.context.buffer();
-    auto error = context.context.faces()["Error"];
+    auto error = context.context.faces()[FaceSpec{{}, "Error"}];
     for (auto& line : display_buffer.lines())
     {
         for (auto atom_it = line.begin(); atom_it != line.end(); ++atom_it)
         {
-            if (atom_it->type() == DisplayAtom::Range)
-            {
-                for (auto it  = get_iterator(buffer, atom_it->begin()),
-                          end = get_iterator(buffer, atom_it->end()); it < end;)
-                {
-                    auto coord = it.coord();
-                    Codepoint cp = utf8::read_codepoint(it, end);
-                    if (cp != '\n' and not iswprint((wchar_t)cp))
-                    {
-                        if (coord != atom_it->begin())
-                            atom_it = ++line.split(atom_it, coord);
-                        if (it.coord() < atom_it->end())
-                            atom_it = line.split(atom_it, it.coord());
+            if (atom_it->type() != DisplayAtom::Range)
+                continue;
 
-                        atom_it->replace("�");
-                        atom_it->face = error;
-                        break;
-                    }
+            auto begin = atom_it->begin();
+            auto line_data = buffer[begin.line].data();
+            for (auto it  = line_data + begin.column, end = line_data + atom_it->end().column; it < end;)
+            {
+                auto next = it;
+                Codepoint cp = utf8::read_codepoint(next, end);
+                if (cp != '\n' and (cp < ' ' or cp > '~') and not iswprint((wchar_t)cp))
+                {
+                    if (ByteCount pos(it - line_data); pos != begin.column)
+                        atom_it = ++line.split(atom_it, {begin.line, pos});
+                    if (ByteCount pos(next - line_data); pos < atom_it->end().column)
+                        atom_it = line.split(atom_it, {begin.line, pos});
+
+                    atom_it->replace("�");
+                    atom_it->face = error;
+                    break;
                 }
+                it = next;
             }
         }
     }
@@ -1718,7 +1682,8 @@ private:
                 setup.cursor_pos.column += cursor_move;
             }
 
-            if (last.line >= setup.first_line and
+            if (setup.ensure_cursor_visible and
+                last.line >= setup.first_line and
                 range.first.line <= setup.first_line + setup.line_count and
                 range.first.line != last.line)
             {
@@ -1753,9 +1718,9 @@ const HighlighterDesc higlighter_group_desc = {
     "Parameters: [-passes <passes>]\n"
     "Creates a group that can contain other highlighters",
     { {
-        { "passes", { true, "flags(colorize|move|wrap) "
-                            "kind of highlighters can be put in the group "
-                            "(default colorize)" } } },
+        { "passes", { ArgCompleter{}, "flags(colorize|move|wrap) "
+                                       "kind of highlighters can be put in the group "
+                                       "(default colorize)" } } },
         ParameterDesc::Flags::SwitchesOnlyAtStart, 0, 0
     }
 };
@@ -1771,9 +1736,9 @@ const HighlighterDesc ref_desc = {
     "Parameters: [-passes <passes>] <path>\n"
     "Reference the highlighter at <path> in shared highlighters",
     { {
-        { "passes", { true, "flags(colorize|move|wrap) "
-                            "kind of highlighters that can be referenced "
-                            "(default colorize)" } } },
+        { "passes", { ArgCompleter{}, "flags(colorize|move|wrap) "
+                                      "kind of highlighters that can be referenced "
+                                      "(default colorize)" } } },
         ParameterDesc::Flags::SwitchesOnlyAtStart, 1, 1
     }
 };
@@ -1850,6 +1815,75 @@ struct RegionMatches : UseMemoryDomain<MemoryDomain::Highlight>
     RegexMatchList recurse_matches;
 };
 
+struct ForwardHighlighterApplier
+{
+    DisplayBuffer& display_buffer;
+    HighlightContext& context;
+    DisplayLineList::iterator cur_line = display_buffer.lines().begin();
+    DisplayLineList::iterator end_line = display_buffer.lines().end();
+    DisplayLine::iterator cur_atom = cur_line->begin();
+    DisplayBuffer region_display{};
+
+    void operator()(BufferCoord begin, BufferCoord end, Highlighter& highlighter)
+    {
+        if (begin == end)
+            return;
+
+        auto first_line = std::find_if(cur_line, end_line, [&](auto&& line) { return line.range().end > begin; });
+        if (first_line != cur_line and first_line != end_line)
+            cur_atom = first_line->begin();
+        cur_line = first_line;
+        if (cur_line == end_line or cur_line->range().begin >= end)
+            return;
+
+        auto& region_lines = region_display.lines();
+        region_lines.clear();
+        Vector<std::pair<DisplayLineList::iterator, size_t>> insert_pos;
+        while (cur_line != end_line and cur_line->range().begin < end)
+        {
+            auto& line = *cur_line;
+            auto first = std::find_if(cur_atom, line.end(), [&](auto&& atom) { return atom.has_buffer_range() and atom.end() > begin; });
+            if (first != line.end() and first->type() == DisplayAtom::Range and first->begin() < begin)
+                first = ++line.split(first, begin);
+            auto idx = first - line.begin();
+
+            auto last = std::find_if(first, line.end(), [&](auto&& atom) { return atom.has_buffer_range() and atom.end() > end; });
+            if (last != line.end() and last->type() == DisplayAtom::Range and last->begin() < end)
+                last = ++line.split(last, end);
+
+            if (line.begin() + idx != last)
+            {
+                insert_pos.emplace_back(cur_line, idx);
+                region_lines.push_back(line.extract(line.begin() + idx, last));
+            }
+
+            if (idx != line.atoms().size())
+                break;
+            else if (++cur_line != end_line)
+                cur_atom = cur_line->begin();
+        }
+
+        if (region_lines.empty())
+            return;
+
+        region_display.compute_range();
+        highlighter.highlight(context, region_display, {begin, end});
+
+        for (size_t i = 0; i < insert_pos.size(); ++i)
+        {
+            auto& [line_it, idx] = insert_pos[i];
+            auto& atoms = region_lines[i].atoms();
+            auto it = line_it->insert(
+                line_it->begin() + idx,
+                std::move_iterator(atoms.begin()),
+                std::move_iterator(atoms.end()));
+
+            if (line_it == cur_line)
+                cur_atom = it + atoms.size();
+        }
+    }
+};
+
 const HighlighterDesc default_region_desc = {
     "Parameters: <delegate_type> <delegate_params>...\n"
     "Define the default region of a regions highlighter",
@@ -1861,8 +1895,8 @@ const HighlighterDesc region_desc = {
     "highlighter as defined by <type> and eventual <params>...\n"
     "The region starts at <begin> match and ends at the first <end>",
     { {
-        { "match-capture", { false, "only consider region ending/recurse delimiters whose first capture group match the region beginning delimiter" } },
-        { "recurse",       { true, "make the region end on the first ending delimiter that does not close the given parameter" } } },
+        { "match-capture", { {}, "only consider region ending/recurse delimiters whose first capture group match the region beginning delimiter" } },
+        { "recurse",       { ArgCompleter{}, "make the region end on the first ending delimiter that does not close the given parameter" } } },
         ParameterDesc::Flags::SwitchesOnlyAtStart | ParameterDesc::Flags::IgnoreUnknownSwitches,
         3
     }
@@ -1902,28 +1936,22 @@ public:
         auto default_region_it = m_regions.find(m_default_region);
         const bool apply_default = default_region_it != m_regions.end();
 
-        auto last_begin = (begin == regions.begin()) ?
-                             range.begin : (begin-1)->end;
+        auto last_begin = (begin == regions.begin()) ? range.begin : (begin-1)->end;
         kak_assert(begin <= end);
+
+        ForwardHighlighterApplier apply_highlighter{display_buffer, context};
         for (; begin != end; ++begin)
         {
             if (apply_default and last_begin < begin->begin)
-                apply_highlighter(context, display_buffer,
-                                  correct(last_begin), correct(begin->begin),
-                                  *default_region_it->value);
+                apply_highlighter(correct(last_begin), correct(begin->begin), *default_region_it->value);
 
-            auto it = m_regions.find(begin->region);
-            if (it == m_regions.end())
-                continue;
-            apply_highlighter(context, display_buffer,
-                              correct(begin->begin), correct(begin->end),
-                              *it->value);
+            apply_highlighter(correct(begin->begin), correct(begin->end), *begin->highlighter);
             last_begin = begin->end;
         }
         if (apply_default and last_begin < display_range.end)
-            apply_highlighter(context, display_buffer,
-                              correct(last_begin), range.end,
-                              *default_region_it->value);
+            apply_highlighter(correct(last_begin), range.end, *default_region_it->value);
+
+        display_buffer.compute_range();
     }
 
     bool has_children() const override { return true; }
@@ -2039,37 +2067,17 @@ public:
         static const ParameterDesc param_desc{ {}, ParameterDesc::Flags::SwitchesOnlyAtStart, 1 };
         ParametersParser parser{params, param_desc};
 
-        auto delegate = HighlighterRegistry::instance()[parser[0]].factory(parser.positionals_from(1), nullptr);
+        const auto& type = parser[0];
+        auto& registry = HighlighterRegistry::instance();
+        auto it = registry.find(type);
+        if (it == registry.end())
+            throw runtime_error(format("no such highlighter type: '{}'", type));
+
+        auto delegate = it->value.factory(parser.positionals_from(1), nullptr);
         return std::make_unique<RegionHighlighter>(std::move(delegate));
     }
 
 private:
-    struct Region
-    {
-        BufferCoord begin;
-        BufferCoord end;
-        StringView region;
-    };
-    using RegionList = Vector<Region, MemoryDomain::Highlight>;
-
-    struct RegexKey
-    {
-        StringView regex;
-        bool match_captures;
-
-        friend size_t hash_value(const RegexKey& key) { return hash_values(key.regex, key.match_captures); }
-        friend bool operator==(const RegexKey&, const RegexKey&) = default;
-    };
-
-    struct Cache
-    {
-        size_t buffer_timestamp = 0;
-        size_t regions_timestamp = 0;
-        LineRangeSet ranges;
-        HashMap<RegexKey, RegexMatchList> matches;
-        HashMap<BufferRange, RegionList, MemoryDomain::Highlight> regions;
-    };
-
     struct RegionHighlighter : public Highlighter
     {
         RegionHighlighter(std::unique_ptr<Highlighter>&& delegate,
@@ -2136,6 +2144,32 @@ private:
         String m_recurse;
         bool  m_match_capture = false;
         bool  m_default = false;
+    };
+
+    struct Region
+    {
+        BufferCoord begin;
+        BufferCoord end;
+        RegionHighlighter* highlighter;
+    };
+    using RegionList = Vector<Region, MemoryDomain::Highlight>;
+
+    struct RegexKey
+    {
+        StringView regex;
+        bool match_captures;
+
+        friend size_t hash_value(const RegexKey& key) { return hash_values(key.regex, key.match_captures); }
+        friend bool operator==(const RegexKey&, const RegexKey&) = default;
+    };
+
+    struct Cache
+    {
+        size_t buffer_timestamp = 0;
+        size_t regions_timestamp = 0;
+        LineRangeSet ranges;
+        HashMap<RegexKey, RegexMatchList> matches;
+        HashMap<BufferRange, RegionList, MemoryDomain::Highlight> regions;
     };
 
 
@@ -2371,24 +2405,24 @@ private:
         for (auto begin = find_next_begin(cache, range.begin); begin; )
         {
             auto& [index, beg_it] = *begin;
-            auto& [name, region] = m_regions.item(index);
-            auto& end_matches = cache.matches.get(RegexKey{region->m_end, region->match_capture()});
-            auto& recurse_matches = region->m_recurse.empty() ?
-                empty_matches : cache.matches.get(RegexKey{region->m_recurse, region->match_capture()});
+            auto& region = *m_regions.item(index).value;
+            auto& end_matches = cache.matches.get(RegexKey{region.m_end, region.match_capture()});
+            auto& recurse_matches = region.m_recurse.empty() ?
+                empty_matches : cache.matches.get(RegexKey{region.m_recurse, region.match_capture()});
 
             auto end_it = find_matching_end(buffer, beg_it->end_coord(), end_matches, recurse_matches,
-                                            region->match_capture() ? beg_it->capture(buffer) : Optional<StringView>{});
+                                            region.match_capture() ? beg_it->capture(buffer) : Optional<StringView>{});
 
             if (end_it == end_matches.end() or end_it->end_coord() >= range.end) // region continue past range end
             {
                 auto begin_coord = beg_it->begin_coord();
                 if (begin_coord < range.end)
-                    regions.push_back({begin_coord, range.end, name});
+                    regions.push_back({begin_coord, range.end, &region});
                 break;
             }
 
             auto end_coord = end_it->end_coord();
-            regions.push_back({beg_it->begin_coord(), end_coord, name});
+            regions.push_back({beg_it->begin_coord(), end_coord, &region});
 
             // With empty begin and end matches (for example if the regexes
             // are /"\K/ and /(?=")/), that case can happen, and would

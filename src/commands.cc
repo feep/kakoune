@@ -20,6 +20,7 @@
 #include "option_manager.hh"
 #include "option_types.hh"
 #include "parameters_parser.hh"
+#include "profile.hh"
 #include "ranges.hh"
 #include "ranked_match.hh"
 #include "regex.hh"
@@ -79,7 +80,7 @@ struct PerArgumentCommandCompleter<Completer, Rest...> : PerArgumentCommandCompl
 
     Completions operator()(const Context& context, CompletionFlags flags,
                            CommandParameters params, size_t token_to_complete,
-                           ByteCount pos_in_token) const
+                           ByteCount pos_in_token)
     {
         if (token_to_complete == 0)
         {
@@ -127,6 +128,27 @@ auto filename_completer = make_completer(
                                             context.options()["ignored_files"].get<Regex>(),
                                             cursor_pos, FilenameFlags::Expand),
                                             menu ? Completions::Flags::Menu : Completions::Flags::None}; });
+
+template<bool menu>
+auto filename_arg_completer =
+    [](const Context& context, CompletionFlags flags, StringView prefix, ByteCount cursor_pos) -> Completions
+    { return { 0_byte, cursor_pos,
+               complete_filename(prefix,
+                                 context.options()["ignored_files"].get<Regex>(),
+                                 cursor_pos, FilenameFlags::OnlyDirectories),
+               menu ? Completions::Flags::Menu : Completions::Flags::None }; };
+
+auto client_arg_completer =
+    [](const Context& context, CompletionFlags flags, StringView prefix, ByteCount cursor_pos) -> Completions
+    { return { 0_byte, cursor_pos,
+               ClientManager::instance().complete_client_name(prefix, cursor_pos),
+               Completions::Flags::Menu }; };
+
+auto arg_completer = [](auto candidates) -> PromptCompleter {
+    return [=](const Context& context, CompletionFlags flags, StringView prefix, ByteCount cursor_pos) -> Completions {
+        return Completions{ 0_byte, cursor_pos, complete(prefix, cursor_pos, candidates), Completions::Flags::Menu };
+    };
+};
 
 template<bool ignore_current = false>
 static Completions complete_buffer_name(const Context& context, CompletionFlags flags,
@@ -241,7 +263,8 @@ struct ShellScriptCompleter
                                                       ShellManager::Flags::WaitForStdout,
                                                       shell_context).first;
         CandidateList candidates;
-        for (auto&& candidate : output | split<StringView>('\n'))
+        for (auto&& candidate : output | split<StringView>('\n')
+                                       | filter([](auto s) { return not s.empty(); }))
             candidates.push_back(candidate.str());
 
         return {0_byte, pos_in_token, std::move(candidates), m_flags};
@@ -257,55 +280,88 @@ struct ShellCandidatesCompleter
                              Completions::Flags flags = Completions::Flags::None)
       : m_shell_script{std::move(shell_script)}, m_flags(flags) {}
 
+    ShellCandidatesCompleter(const ShellCandidatesCompleter& other) : m_shell_script{other.m_shell_script}, m_flags(other.m_flags) {}
+    ShellCandidatesCompleter& operator=(const ShellCandidatesCompleter& other) {  m_shell_script = other.m_shell_script; m_flags = other.m_flags; return *this; }
+
     Completions operator()(const Context& context, CompletionFlags flags,
                            CommandParameters params, size_t token_to_complete,
                            ByteCount pos_in_token)
     {
-        if (flags & CompletionFlags::Start)
-            m_token = -1;
-
-        if (m_token != token_to_complete)
+        if (m_last_token != token_to_complete)
         {
             ShellContext shell_context{
                 params,
                 { { "token_to_complete", to_string(token_to_complete) } }
             };
-            String output = ShellManager::instance().eval(m_shell_script, context, {},
-                                                          ShellManager::Flags::WaitForStdout,
-                                                          shell_context).first;
+            m_running_script.emplace(ShellManager::instance().spawn(m_shell_script, context, false, shell_context));
+            m_watcher.emplace((int)m_running_script->out, FdEvents::Read, EventMode::Urgent,
+                              [this, &input_handler=context.input_handler()](auto&&... args) { read_candidates(input_handler); });
             m_candidates.clear();
-            for (auto c : output | split<StringView>('\n'))
-                m_candidates.emplace_back(c.str(), used_letters(c));
-            m_token = token_to_complete;
+            m_last_token = token_to_complete;
+        }
+        return rank_candidates(params[token_to_complete].substr(0, pos_in_token));
+    }
+
+private:
+    void read_candidates(InputHandler& input_handler)
+    {
+        char buffer[2048];
+        bool closed = false;
+        int fd = (int)m_running_script->out;
+        while (fd_readable(fd))
+        {
+            int size = read(fd, buffer, sizeof(buffer));
+            if (size == 0)
+            {
+                closed = true;
+                break;
+            }
+            m_stdout_buffer.insert(m_stdout_buffer.end(), buffer, buffer + size);
         }
 
-        StringView query = params[token_to_complete].substr(0, pos_in_token);
+        auto end = closed ? m_stdout_buffer.end() : find(m_stdout_buffer | reverse(), '\n').base();
+        for (auto c : ArrayView(m_stdout_buffer.begin(), end) | split<StringView>('\n')
+                                                              | filter([](auto s) { return not s.empty(); }))
+            m_candidates.emplace_back(c.str(), used_letters(c));
+        m_stdout_buffer.erase(m_stdout_buffer.begin(), end);
+
+        input_handler.refresh_ifn();
+        if (not closed)
+            return;
+
+        m_running_script.reset();
+        m_watcher.reset();
+    }
+
+    Completions rank_candidates(StringView query)
+    {
         UsedLetters query_letters = used_letters(query);
         Vector<RankedMatch> matches;
-        for (const auto& candidate : m_candidates)
+        for (auto&& candidate : m_candidates)
         {
-            if (RankedMatch match{candidate.first, candidate.second, query, query_letters})
-                matches.push_back(match);
+            if (RankedMatch m{candidate.first, candidate.second, query, query_letters})
+                matches.push_back(m);
         }
 
         constexpr size_t max_count = 100;
         CandidateList res;
         // Gather best max_count matches
-        for_n_best(matches, max_count, [](auto& lhs, auto& rhs) { return rhs < lhs; },
-                   [&] (const RankedMatch& m) {
+        for_n_best(matches, max_count, [](auto& lhs, auto& rhs) { return rhs < lhs; }, [&] (const RankedMatch& m) {
             if (not res.empty() and res.back() == m.candidate())
                 return false;
             res.push_back(m.candidate().str());
             return true;
         });
 
-        return Completions{0_byte, pos_in_token, std::move(res), m_flags};
+        return Completions{0_byte, query.length(), std::move(res), m_flags};
     }
 
-private:
     String m_shell_script;
+    Vector<char, MemoryDomain::Completion> m_stdout_buffer;
+    Optional<Shell> m_running_script;
+    Optional<FDWatcher> m_watcher;
     Vector<std::pair<String, UsedLetters>, MemoryDomain::Completion> m_candidates;
-    int m_token = -1;
+    int m_last_token = -1;
     Completions::Flags m_flags;
 };
 
@@ -386,7 +442,7 @@ void edit(const ParametersParser& parser, Context& context, const ShellContext&)
         {
             if (buffer != nullptr and force_reload)
                 buffer_manager.delete_buffer(*buffer);
-            buffer = create_buffer_from_string(std::move(name), flags, {});
+            buffer = create_buffer_from_string(name, flags, {});
         }
         else if (buffer->flags() & Buffer::Flags::File)
             throw runtime_error(format("buffer '{}' exists but is not a scratch buffer", name));
@@ -442,12 +498,12 @@ void edit(const ParametersParser& parser, Context& context, const ShellContext&)
 }
 
 ParameterDesc edit_params{
-    { { "existing", { false, "fail if the file does not exist, do not open a new file" } },
-      { "scratch",  { false, "create a scratch buffer, not linked to a file" } },
-      { "debug",    { false, "create buffer as debug output" } },
-      { "fifo",     { true,  "create a buffer reading its content from a named fifo" } },
-      { "readonly", { false, "create a buffer in readonly mode" } },
-      { "scroll",   { false, "place the initial cursor so that the fifo will scroll to show new data" } } },
+    { { "existing", { {}, "fail if the file does not exist, do not open a new file" } },
+      { "scratch",  { {}, "create a scratch buffer, not linked to a file" } },
+      { "debug",    { {}, "create buffer as debug output" } },
+      { "fifo",     { {filename_arg_completer<true>},  "create a buffer reading its content from a named fifo" } },
+      { "readonly", { {}, "create a buffer in readonly mode" } },
+      { "scroll",   { {}, "place the initial cursor so that the fifo will scroll to show new data" } } },
       ParameterDesc::Flags::None, 0, 3
 };
 const CommandDesc edit_cmd = {
@@ -475,17 +531,17 @@ const CommandDesc force_edit_cmd = {
 
 const ParameterDesc write_params = {
     {
-        { "sync", { false, "force the synchronization of the file onto the filesystem" } },
-        { "method", { true, "explicit writemethod (replace|overwrite)" } },
-        { "force", { false, "Allow overwriting existing file with explicit filename" } }
+        { "sync", { {}, "force the synchronization of the file onto the filesystem" } },
+        { "method", { {arg_completer(Array{"replace", "overwrite"})}, "explicit writemethod (replace|overwrite)" } },
+        { "force", { {}, "Allow overwriting existing file with explicit filename" } }
     },
     ParameterDesc::Flags::None, 0, 1
 };
 
 const ParameterDesc write_params_except_force = {
     {
-        { "sync", { false, "force the synchronization of the file onto the filesystem" } },
-        { "method", { true, "explicit writemethod (replace|overwrite)" } },
+        { "sync", { {}, "force the synchronization of the file onto the filesystem" } },
+        { "method", { {arg_completer(Array{"replace", "overwrite"})}, "explicit writemethod (replace|overwrite)" } },
     },
     ParameterDesc::Flags::None, 0, 1
 };
@@ -662,6 +718,17 @@ const CommandDesc force_kill_cmd = {
     CommandHelper{},
     CommandCompleter{},
     kill<true>
+};
+
+const CommandDesc daemonize_session_cmd = {
+    "daemonize-session",
+    nullptr,
+    "daemonize-session: set the session server not to quit on last client exit",
+    { {} },
+    CommandFlags::None,
+    CommandHelper{},
+    CommandCompleter{},
+    [](const ParametersParser&, Context&, const ShellContext&) { Server::instance().daemonize(); }
 };
 
 template<bool force>
@@ -870,8 +937,8 @@ const CommandDesc rename_buffer_cmd = {
     "rename-buffer <name>: change current buffer name",
     ParameterDesc{
         {
-            { "scratch",  { false, "convert a file buffer to a scratch buffer" } },
-            { "file",  { false, "convert a scratch buffer to a file buffer" } }
+            { "scratch",  { {}, "convert a file buffer to a scratch buffer" } },
+            { "file",  { {}, "convert a scratch buffer to a file buffer" } }
         },
         ParameterDesc::Flags::None, 1, 1
     },
@@ -952,20 +1019,23 @@ static void redraw_relevant_clients(Context& context, StringView highlighter_pat
 {
     StringView scope{highlighter_path.begin(), find(highlighter_path, '/')};
     if (scope == "window")
-        context.window().force_redraw();
+    {
+        if (context.has_client())
+            context.client().force_redraw();
+    }
     else if (scope == "buffer" or prefix_match(scope, "buffer="))
     {
         auto& buffer = scope == "buffer" ? context.buffer() : BufferManager::instance().get_buffer(scope.substr(7_byte));
         for (auto&& client : ClientManager::instance())
         {
             if (&client->context().buffer() == &buffer)
-                client->context().window().force_redraw();
+                client->force_redraw();
         }
     }
     else
     {
         for (auto&& client : ClientManager::instance())
-            client->context().window().force_redraw();
+            client->force_redraw();
     }
 }
 
@@ -995,7 +1065,7 @@ const CommandDesc add_highlighter_cmd = {
     "    <path> is a '/' delimited path or the parent highlighter, starting with either\n"
     "   'global', 'buffer', 'window' or 'shared', if <name> is empty, it will be autogenerated",
     ParameterDesc{
-        { { "override", { false, "replace existing highlighter with same path if it exists" } }, },
+        { { "override", { {}, "replace existing highlighter with same path if it exists" } }, },
         ParameterDesc::Flags::SwitchesOnlyAtStart, 2
     },
     CommandFlags::None,
@@ -1095,18 +1165,14 @@ const CommandDesc add_hook_cmd = {
     "            (and any window for that buffer)\n"
     "  * window: hook is executed only for the current window\n",
     ParameterDesc{
-        { { "group", { true, "set hook group, see remove-hooks" } },
-          { "always", { false, "run hook even if hooks are disabled" } },
-          { "once", { false, "run the hook only once" } } },
+        { { "group", { ArgCompleter{}, "set hook group, see remove-hooks" } },
+          { "always", { {}, "run hook even if hooks are disabled" } },
+          { "once", { {}, "run the hook only once" } } },
         ParameterDesc::Flags::None, 4, 4
     },
     CommandFlags::None,
     CommandHelper{},
-    make_completer(menu(complete_scope), menu(complete_hooks), complete_nothing,
-                   [](const Context& context, CompletionFlags flags,
-                      StringView prefix, ByteCount cursor_pos)
-                   { return CommandManager::instance().complete(
-                         context, flags, prefix, cursor_pos); }),
+    make_completer(menu(complete_scope), menu(complete_hooks), complete_nothing, CommandManager::Completer{}),
     [](const ParametersParser& parser, Context& context, const ShellContext&)
     {
         auto descs = enum_desc(Meta::Type<Hook>{});
@@ -1125,7 +1191,7 @@ const CommandDesc add_hook_cmd = {
         const auto flags = (parser.get_switch("always") ? HookFlags::Always : HookFlags::None) |
                            (parser.get_switch("once")   ? HookFlags::Once   : HookFlags::None);
         get_scope(parser[0], context).hooks().add_hook(it->value, group.str(), flags,
-                                                       std::move(regex), command);
+                                                       std::move(regex), command, context);
     }
 };
 
@@ -1232,15 +1298,7 @@ CommandCompleter make_command_completer(StringView type, StringView param, Compl
         return ShellCandidatesCompleter{param.str(), completions_flags};
     }
     else if (type == "command")
-    {
-        return [](const Context& context, CompletionFlags flags,
-                  CommandParameters params,
-                  size_t token_to_complete, ByteCount pos_in_token)
-        {
-            return CommandManager::instance().complete(
-                context, flags, params, token_to_complete, pos_in_token);
-        };
-    }
+        return CommandManager::NestedCompleter{};
     else if (type == "shell")
     {
         return [=](const Context& context, CompletionFlags flags,
@@ -1333,19 +1391,19 @@ const CommandDesc define_command_cmd = {
     "def",
     "define-command [<switches>] <name> <cmds>: define a command <name> executing <cmds>",
     ParameterDesc{
-        { { "params",                   { true,  "take parameters, accessible to each shell escape as $0..$N\n"
+        { { "params",                   { ArgCompleter{},  "take parameters, accessible to each shell escape as $0..$N\n"
                                                  "parameter should take the form <count> or <min>..<max> (both omittable)" } },
-          { "override",                 { false, "allow overriding an existing command" } },
-          { "hidden",                   { false, "do not display the command in completion candidates" } },
-          { "docstring",                { true,  "define the documentation string for command" } },
-          { "menu",                     { false, "treat completions as the only valid inputs" } },
-          { "file-completion",          { false, "complete parameters using filename completion" } },
-          { "client-completion",        { false, "complete parameters using client name completion" } },
-          { "buffer-completion",        { false, "complete parameters using buffer name completion" } },
-          { "command-completion",       { false, "complete parameters using kakoune command completion" } },
-          { "shell-completion",         { false, "complete parameters using shell command completion" } },
-          { "shell-script-completion",  { true,  "complete parameters using the given shell-script" } },
-          { "shell-script-candidates",  { true,  "get the parameter candidates using the given shell-script" } } },
+          { "override",                 { {}, "allow overriding an existing command" } },
+          { "hidden",                   { {}, "do not display the command in completion candidates" } },
+          { "docstring",                { ArgCompleter{},  "define the documentation string for command" } },
+          { "menu",                     { {}, "treat completions as the only valid inputs" } },
+          { "file-completion",          { {}, "complete parameters using filename completion" } },
+          { "client-completion",        { {}, "complete parameters using client name completion" } },
+          { "buffer-completion",        { {}, "complete parameters using buffer name completion" } },
+          { "command-completion",       { {}, "complete parameters using kakoune command completion" } },
+          { "shell-completion",         { {}, "complete parameters using shell command completion" } },
+          { "shell-script-completion",  { ArgCompleter{},  "complete parameters using the given shell-script" } },
+          { "shell-script-candidates",  { ArgCompleter{},  "get the parameter candidates using the given shell-script" } } },
         ParameterDesc::Flags::None,
         2, 2
     },
@@ -1406,7 +1464,7 @@ const CommandDesc complete_command_cmd = {
     "complete-command [<switches>] <name> <type> [<param>]\n"
     "define command completion",
     ParameterDesc{
-        { { "menu",                     { false, "treat completions as the only valid inputs" } }, },
+        { { "menu",                     { {}, "treat completions as the only valid inputs" } }, },
         ParameterDesc::Flags::None, 2, 3},
     CommandFlags::None,
     CommandHelper{},
@@ -1424,11 +1482,12 @@ const CommandDesc echo_cmd = {
     nullptr,
     "echo <params>...: display given parameters in the status line",
     ParameterDesc{
-        { { "markup", { false, "parse markup" } },
-          { "quoting", { true, "quote each argument separately using the given style (raw|kakoune|shell)" } },
-          { "to-file", { true, "echo contents to given filename" } },
-          { "to-shell-script", { true, "pipe contents to given shell script" } },
-          { "debug", { false, "write to debug buffer instead of status line" } } },
+        { { "markup", { {}, "parse markup" } },
+          { "quoting", { {arg_completer(Array{"raw", "kakoune", "shell"})}, "quote each argument separately using the given style (raw|kakoune|shell)" } },
+          { "end-of-line", { {}, "add trailing end-of-line" } },
+          { "to-file", { {filename_arg_completer<false>}, "echo contents to given filename" } },
+          { "to-shell-script", { ArgCompleter{}, "pipe contents to given shell script" } },
+          { "debug", { {}, "write to debug buffer instead of status line" } } },
         ParameterDesc::Flags::SwitchesOnlyAtStart
     },
     CommandFlags::None,
@@ -1442,6 +1501,9 @@ const CommandDesc echo_cmd = {
                            ' ', false);
         else
             message = join(parser, ' ', false);
+
+        if (parser.get_switch("end-of-line"))
+            message.push_back('\n');
 
         if (auto filename = parser.get_switch("to-file"))
             write_to_file(*filename, message);
@@ -1571,7 +1633,7 @@ const CommandDesc debug_cmd = {
                 KeymapMode m = parse_keymap_mode(mode, user_modes);
                 for (auto& key : keymaps.get_mapped_keys(m))
                     write_to_debug_buffer(format(" * {} {}: {}",
-                                          mode, key, keymaps.get_mapping(key, m).docstring));
+                                          mode, key, keymaps.get_mapping_docstring(key, m)));
             }
         }
         else if (parser[0] == "regex")
@@ -1612,9 +1674,9 @@ const CommandDesc source_cmd = {
     filename_completer<true>,
     [](const ParametersParser& parser, Context& context, const ShellContext&)
     {
-        const DebugFlags debug_flags = context.options()["debug"].get<DebugFlags>();
-        const bool profile = debug_flags & DebugFlags::Profile;
-        auto start_time = profile ? Clock::now() : Clock::time_point{};
+        ProfileScope profile{context, [&](std::chrono::microseconds duration) {
+            write_to_debug_buffer(format("sourcing '{}' took {} us", parser[0], (size_t)duration.count()));
+        }};
 
         String path = real_path(parse_filename(parser[0]));
         MappedFile file_content{path};
@@ -1629,11 +1691,6 @@ const CommandDesc source_cmd = {
             write_to_debug_buffer(format("{}:{}", parser[0], err.what()));
             throw;
         }
-
-        using namespace std::chrono;
-        if (profile)
-            write_to_debug_buffer(format("sourcing '{}' took {} us", parser[0],
-                                         (size_t)duration_cast<microseconds>(Clock::now() - start_time).count()));
     }
 };
 
@@ -1664,8 +1721,8 @@ const CommandDesc set_option_cmd = {
     "<scope> can be global, buffer, window, or current which refers to the narrowest "
     "scope the option is set in",
     ParameterDesc{
-        { { "add",    { false, "add to option rather than replacing it" } },
-          { "remove", { false, "remove from option rather than replacing it" } } },
+        { { "add",    { {}, "add to option rather than replacing it" } },
+          { "remove", { {}, "remove from option rather than replacing it" } } },
         ParameterDesc::Flags::SwitchesOnlyAtStart, 2, (size_t)-1
     },
     CommandFlags::None,
@@ -1774,8 +1831,8 @@ const CommandDesc declare_option_cmd = {
     "    range-specs: list of range specs\n"
     "    str-to-str-map: map from strings to strings\n",
     ParameterDesc{
-        { { "hidden",    { false, "do not display option name when completing" } },
-          { "docstring", { true,  "specify option description" } } },
+        { { "hidden",    { {}, "do not display option name when completing" } },
+          { "docstring", { ArgCompleter{},  "specify option description" } } },
         ParameterDesc::Flags::SwitchesOnlyAtStart, 2, (size_t)-1
     },
     CommandFlags::None,
@@ -1860,7 +1917,7 @@ const CommandDesc map_key_cmd = {
     nullptr,
     "map [<switches>] <scope> <mode> <key> <keys>: map <key> to <keys> in given <mode> in <scope>",
     ParameterDesc{
-        { { "docstring", { true,  "specify mapping description" } } },
+        { { "docstring", { ArgCompleter{},  "specify mapping description" } } },
         ParameterDesc::Flags::None, 4, 4
     },
     CommandFlags::None,
@@ -1908,8 +1965,7 @@ const CommandDesc unmap_key_cmd = {
 
         if (keymaps.is_mapped(key[0], keymap_mode) and
             (parser.positional_count() < 4 or
-             (keymaps.get_mapping(key[0], keymap_mode).keys ==
-              parse_keys(parser[3]))))
+             keymaps.get_mapping_keys(key[0], keymap_mode) == parse_keys(parser[3])))
             keymaps.unmap_key(key[0], keymap_mode);
     }
 };
@@ -1918,11 +1974,11 @@ template<size_t... P>
 ParameterDesc make_context_wrap_params_impl(Array<HashItem<String, SwitchDesc>, sizeof...(P)>&& additional_params,
                                             std::index_sequence<P...>)
 {
-    return { { { "client",     { true,  "run in given client context" } },
-               { "try-client", { true,  "run in given client context if it exists, or else in the current one" } },
-               { "buffer",     { true,  "run in a disposable context for each given buffer in the comma separated list argument" } },
-               { "draft",      { false, "run in a disposable context" } },
-               { "itersel",    { false, "run once for each selection with that selection as the only one" } },
+    return { { { "client",     { {client_arg_completer},  "run in given client context" } },
+               { "try-client", { {client_arg_completer},  "run in given client context if it exists, or else in the current one" } },
+               { "buffer",     { {complete_buffer_name<false>},  "run in a disposable context for each given buffer in the comma separated list argument" } },
+               { "draft",      { {}, "run in a disposable context" } },
+               { "itersel",    { {}, "run once for each selection with that selection as the only one" } },
                std::move(additional_params[P])...},
         ParameterDesc::Flags::SwitchesOnlyAtStart, 1
     };
@@ -1967,7 +2023,7 @@ void context_wrap(const ParametersParser& parser, Context& context, StringView d
                                        Context::Flags::Draft};
             Context& c = input_handler.context();
 
-            ScopedSetBool disable_history(c.history_disabled());
+            ScopedSetBool noninteractive(c.noninteractive());
 
             func(parser, c);
         };
@@ -2018,7 +2074,7 @@ void context_wrap(const ParametersParser& parser, Context& context, StringView d
 
     Context& c = *effective_context;
 
-    ScopedSetBool disable_history(c.history_disabled());
+    ScopedSetBool noninteractive(c.noninteractive());
     ScopedEdition edition{c};
     ScopedSelectionEdition selection_edition{c};
 
@@ -2087,9 +2143,9 @@ const CommandDesc execute_keys_cmd = {
     "exec",
     "execute-keys [<switches>] <keys>: execute given keys as if entered by user",
     make_context_wrap_params<3>({{
-        {"save-regs",  {true, "restore all given registers after execution (default: '/\"|^@:')"}},
-        {"with-maps",  {false, "use user defined key mapping when executing keys"}},
-        {"with-hooks", {false, "trigger hooks while executing keys"}}
+        {"save-regs",  {ArgCompleter{}, "restore all given registers after execution (default: '/\"|^@:')"}},
+        {"with-maps",  {{}, "use user defined key mapping when executing keys"}},
+        {"with-hooks", {{}, "trigger hooks while executing keys"}}
     }}),
     CommandFlags::None,
     CommandHelper{},
@@ -2111,9 +2167,9 @@ const CommandDesc evaluate_commands_cmd = {
     "eval",
     "evaluate-commands [<switches>] <commands>...: execute commands as if entered by user",
     make_context_wrap_params<3>({{
-        {"save-regs",  {true, "restore all given registers after execution (default: '')"}},
-        {"no-hooks", { false, "disable hooks while executing commands" }},
-        {"verbatim", { false, "do not reparse argument" }}
+        {"save-regs",  {ArgCompleter{}, "restore all given registers after execution (default: '')"}},
+        {"no-hooks", { {}, "disable hooks while executing commands" }},
+        {"verbatim", { {}, "do not reparse argument" }}
     }}),
     CommandFlags::None,
     CommandHelper{},
@@ -2125,7 +2181,7 @@ const CommandDesc evaluate_commands_cmd = {
             ScopedSetBool disable_hooks(context.hooks_disabled(), no_hooks);
 
             if (parser.get_switch("verbatim"))
-                CommandManager::instance().execute_single_command(parser | gather<Vector>(), context, shell_context);
+                CommandManager::instance().execute_single_command(parser | gather<Vector<String>>(), context, shell_context);
             else
                 CommandManager::instance().execute(join(parser, ' ', false), context, shell_context);
         });
@@ -2149,18 +2205,18 @@ const CommandDesc prompt_cmd = {
     "prompt [<switches>] <prompt> <command>: prompt the user to enter a text string "
     "and then executes <command>, entered text is available in the 'text' value",
     ParameterDesc{
-        { { "init", { true, "set initial prompt content" } },
-          { "password", { false, "Do not display entered text and clear reg after command" } },
-          { "menu", { false, "treat completions as the only valid inputs" } },
-          { "file-completion", { false, "use file completion for prompt" } },
-          { "client-completion", { false, "use client completion for prompt" } },
-          { "buffer-completion", { false, "use buffer completion for prompt" } },
-          { "command-completion", { false, "use command completion for prompt" } },
-          { "shell-completion", { false, "use shell command completion for prompt" } },
-          { "shell-script-completion", { true, "use shell command completion for prompt" } },
-          { "shell-script-candidates", { true, "use shell command completion for prompt" } },
-          { "on-change", { true, "command to execute whenever the prompt changes" } },
-          { "on-abort", { true, "command to execute whenever the prompt is canceled" } } },
+        { { "init", { ArgCompleter{}, "set initial prompt content" } },
+          { "password", { {}, "Do not display entered text and clear reg after command" } },
+          { "menu", { {}, "treat completions as the only valid inputs" } },
+          { "file-completion", { {}, "use file completion for prompt" } },
+          { "client-completion", { {}, "use client completion for prompt" } },
+          { "buffer-completion", { {}, "use buffer completion for prompt" } },
+          { "command-completion", { {}, "use command completion for prompt" } },
+          { "shell-completion", { {}, "use shell command completion for prompt" } },
+          { "shell-script-completion", { ArgCompleter{}, "use shell command completion for prompt" } },
+          { "shell-script-candidates", { ArgCompleter{}, "use shell command completion for prompt" } },
+          { "on-change", { ArgCompleter{}, "command to execute whenever the prompt changes" } },
+          { "on-abort", { ArgCompleter{}, "command to execute whenever the prompt is canceled" } } },
         ParameterDesc::Flags::None, 2, 2
     },
     CommandFlags::None,
@@ -2196,7 +2252,7 @@ const CommandDesc prompt_cmd = {
                     sc.env_vars.erase("text"_sv);
                 });
 
-                ScopedSetBool disable_history{context.history_disabled()};
+                ScopedSetBool noninteractive{context.noninteractive()};
 
                 StringView cmd;
                 switch (event)
@@ -2224,9 +2280,9 @@ const CommandDesc menu_cmd = {
     "menu [<switches>] <name1> <commands1> <name2> <commands2>...: display a "
     "menu and execute commands for the selected item",
     ParameterDesc{
-        { { "auto-single", { false, "instantly validate if only one item is available" } },
-          { "select-cmds", { false, "each item specify an additional command to run when selected" } },
-          { "markup", { false, "parse menu entries as markup text" } } }
+        { { "auto-single", { {}, "instantly validate if only one item is available" } },
+          { "select-cmds", { {}, "each item specify an additional command to run when selected" } },
+          { "markup", { {}, "parse menu entries as markup text" } } }
     },
     CommandFlags::None,
     CommandHelper{},
@@ -2243,7 +2299,7 @@ const CommandDesc menu_cmd = {
 
         if (count == modulo and parser.get_switch("auto-single"))
         {
-            ScopedSetBool disable_history{context.history_disabled()};
+            ScopedSetBool noninteractive{context.noninteractive()};
 
             CommandManager::instance().execute(parser[1], context);
             return;
@@ -2267,7 +2323,7 @@ const CommandDesc menu_cmd = {
         CapturedShellContext sc{shell_context};
         context.input_handler().menu(std::move(choices),
             [=](int choice, MenuEvent event, Context& context) {
-                ScopedSetBool disable_history{context.history_disabled()};
+                ScopedSetBool noninteractive{context.noninteractive()};
 
                 if (event == MenuEvent::Validate and choice >= 0 and choice < commands.size())
                   CommandManager::instance().execute(commands[choice], context, sc);
@@ -2283,7 +2339,7 @@ const CommandDesc on_key_cmd = {
     "on-key [<switches>] <command>: wait for next user key and then execute <command>, "
     "with key available in the `key` value",
     ParameterDesc{
-        { { "mode-name", { true, "set mode name to use" } } },
+        { { "mode-name", { ArgCompleter{}, "set mode name to use" } } },
         ParameterDesc::Flags::None, 1, 1
     },
     CommandFlags::None,
@@ -2298,7 +2354,7 @@ const CommandDesc on_key_cmd = {
             parser.get_switch("mode-name").value_or("on-key"),
             KeymapMode::None, [=](Key key, Context& context) mutable {
             sc.env_vars["key"_sv] = to_string(key);
-            ScopedSetBool disable_history{context.history_disabled()};
+            ScopedSetBool noninteractive{context.noninteractive()};
 
             CommandManager::instance().execute(command, context, sc);
         });
@@ -2310,10 +2366,10 @@ const CommandDesc info_cmd = {
     nullptr,
     "info [<switches>] <text>: display an info box containing <text>",
     ParameterDesc{
-        { { "anchor", { true, "set info anchoring <line>.<column>" } },
-          { "style", { true, "set info style (above, below, menu, modal)" } },
-          { "markup", { false, "parse markup" } },
-          { "title", { true, "set info title" } } },
+        { { "anchor", { ArgCompleter{}, "set info anchoring <line>.<column>" } },
+          { "style", { {arg_completer(Array{"above", "below", "menu", "modal"})}, "set info style (above, below, menu, modal)" } },
+          { "markup", { {}, "parse markup" } },
+          { "title", { ArgCompleter{}, "set info title" } } },
         ParameterDesc::Flags::None, 0, 1
     },
     CommandFlags::None,
@@ -2516,9 +2572,9 @@ const CommandDesc select_cmd = {
     "\n"
     "selection_desc format is <anchor_line>.<anchor_column>,<cursor_line>.<cursor_column>",
     ParameterDesc{{
-            {"timestamp", {true, "specify buffer timestamp at which those selections are valid"}},
-            {"codepoint", {false, "columns are specified in codepoints, not bytes"}},
-            {"display-column", {false, "columns are specified in display columns, not bytes"}}
+            {"timestamp", {ArgCompleter{}, "specify buffer timestamp at which those selections are valid"}},
+            {"codepoint", {{}, "columns are specified in codepoints, not bytes"}},
+            {"display-column", {{}, "columns are specified in display columns, not bytes"}}
         },
         ParameterDesc::Flags::SwitchesOnlyAtStart, 1
     },
@@ -2605,7 +2661,7 @@ const CommandDesc declare_user_mode_cmd = {
     CommandCompleter{},
     [](const ParametersParser& parser, Context& context, const ShellContext&)
     {
-        context.keymaps().add_user_mode(std::move(parser[0]));
+        context.keymaps().add_user_mode(parser[0]);
     }
 };
 
@@ -2619,14 +2675,14 @@ void enter_user_mode(Context& context, String mode_name, KeymapMode mode, bool l
         if (not context.keymaps().is_mapped(key, mode))
             return;
 
-        auto& mapping = context.keymaps().get_mapping(key, mode);
         ScopedSetBool disable_keymaps(context.keymaps_disabled());
-        ScopedSetBool disable_history(context.history_disabled());
+        ScopedSetBool noninteractive(context.noninteractive());
 
         InputHandler::ScopedForceNormal force_normal{context.input_handler(), {}};
 
         ScopedEdition edition(context);
-        for (auto& key : mapping.keys)
+
+        for (auto& key : context.keymaps().get_mapping_keys(key, mode))
             context.input_handler().handle_key(key);
 
         if (lock)
@@ -2640,7 +2696,7 @@ const CommandDesc enter_user_mode_cmd = {
     nullptr,
     "enter-user-mode [<switches>] <name>: enable <name> keymap mode for next key",
     ParameterDesc{
-        { { "lock", { false, "stay in mode until <esc> is pressed" } } },
+        { { "lock", { {}, "stay in mode until <esc> is pressed" } } },
         ParameterDesc::Flags::None, 1, 1
     },
     CommandFlags::None,
@@ -2661,7 +2717,7 @@ const CommandDesc enter_user_mode_cmd = {
     {
         auto lock = (bool)parser.get_switch("lock");
         KeymapMode mode = parse_keymap_mode(parser[0], context.keymaps().user_modes());
-        enter_user_mode(context, std::move(parser[0]), mode, lock);
+        enter_user_mode(context, parser[0], mode, lock);
     }
 };
 
@@ -2670,7 +2726,7 @@ const CommandDesc provide_module_cmd = {
     nullptr,
     "provide-module [<switches>] <name> <cmds>: declares a module <name> provided by <cmds>",
     ParameterDesc{
-        { { "override", { false, "allow overriding an existing module" } } },
+        { { "override", { {}, "allow overriding an existing module" } } },
         ParameterDesc::Flags::None,
         2, 2
     },
@@ -2731,6 +2787,7 @@ void register_commands()
     register_command(write_all_quit_cmd);
     register_command(kill_cmd);
     register_command(force_kill_cmd);
+    register_command(daemonize_session_cmd);
     register_command(quit_cmd);
     register_command(force_quit_cmd);
     register_command(write_quit_cmd);

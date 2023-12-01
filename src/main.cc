@@ -16,6 +16,7 @@
 #include "terminal_ui.hh"
 #include "option_types.hh"
 #include "parameters_parser.hh"
+#include "profile.hh"
 #include "ranges.hh"
 #include "regex.hh"
 #include "register_manager.hh"
@@ -44,6 +45,26 @@ struct {
     unsigned int version;
     StringView notes;
 } constexpr version_notes[] = { {
+        0,
+        "» asynchronous {+u}shell-script-candidates{} completion\n"
+        "» {+b}%val{window_range}{} is now emitted as separate strings\n"
+        "» {+b}+{} only duplicates identical selections a single time\n"
+        "» {+u}daemonize-session{} command\n"
+        "» view mode and mouse scrolling no longer change selections\n"
+        "» {+u}git apply/edit/grep{} commands\n"
+    }, {
+        20230805,
+        "» Fix FreeBSD/MacOS clang compilation\n"
+    }, {
+        20230729,
+        "» {+b}<a-u>{} and {+b}<a-U>{} now undo/redo selection changes; "
+        "the previous meaning of moving in history tree has been moved to "
+        "{+b}<c-j>{} and {+b}<c-k>{}\n"
+        "» {+u}%exp\\{...}{} expansions provide flexible quoting for expanded "
+        "strings (as double quoted strings)\n"
+        "» {+u}show-matching -previous{} switch\n"
+        "» {+b}<c-g>{} to cancel current operation\n"
+    }, {
         20221031,
         "» {+b}<esc>{} does not end macro recording anymore, use {+b}Q{}\n"
         "» pipe commands do not append final end-of-lines anymore\n"
@@ -136,24 +157,24 @@ void show_startup_info(Client* local_client, int last_version)
 {
     const Face version_face{Color::Default, Color::Default, Attribute::Bold};
     DisplayLineList info;
-    for (auto note : version_notes)
+    for (auto [version, notes] : version_notes)
     {
-        if (note.version and note.version <= last_version)
+        if (version and version <= last_version)
             continue;
 
-        if (not note.version)
+        if (not version)
             info.push_back({"• Development version", version_face});
         else
         {
-            const auto year = note.version / 10000;
-            const auto month = (note.version / 100) % 100;
-            const auto day = note.version % 100;
+            const auto year = version / 10000;
+            const auto month = (version / 100) % 100;
+            const auto day = version % 100;
             info.push_back({format("• Kakoune v{}.{}{}.{}{}",
                                    year, month < 10 ? "0" : "", month, day < 10 ? "0" : "", day),
                             version_face});
         }
 
-        for (auto&& line : note.notes | split<StringView>('\n'))
+        for (auto&& line : notes | split<StringView>('\n'))
             info.push_back(parse_display_line(line, GlobalScope::instance().faces()));
     }
     if (not info.empty())
@@ -209,7 +230,7 @@ static const EnvVarDesc builtin_env_vars[] = { {
     }, {
         "buflist", false,
         [](StringView name, const Context& context) -> Vector<String>
-        { return BufferManager::instance() | transform(&Buffer::display_name) | gather<Vector>(); }
+        { return BufferManager::instance() | transform(&Buffer::display_name) | gather<Vector<String>>(); }
     }, {
         "buf_line_count", false,
         [](StringView name, const Context& context) -> Vector<String>
@@ -277,7 +298,7 @@ static const EnvVarDesc builtin_env_vars[] = { {
         [](StringView name, const Context& context) -> Vector<String>
         { return ClientManager::instance() |
                       transform([](const std::unique_ptr<Client>& c) -> const String&
-                                { return c->context().name(); }) | gather<Vector>(); }
+                                { return c->context().name(); }) | gather<Vector<String>>(); }
     }, {
         "modified", false,
         [](StringView name, const Context& context) -> Vector<String>
@@ -323,21 +344,21 @@ static const EnvVarDesc builtin_env_vars[] = { {
         { return main_sel_first(context.selections()) |
                      transform([&buffer=context.buffer()](const Selection& sel) {
                          return selection_to_string(ColumnType::Byte, buffer, sel);
-                     }) | gather<Vector>(); }
+                     }) | gather<Vector<String>>(); }
     }, {
         "selections_char_desc", false,
         [](StringView name, const Context& context) -> Vector<String>
         { return main_sel_first(context.selections()) |
                      transform([&buffer=context.buffer()](const Selection& sel) {
                          return selection_to_string(ColumnType::Codepoint, buffer, sel);
-                     }) | gather<Vector>(); }
+                     }) | gather<Vector<String>>(); }
     }, {
         "selections_display_column_desc", false,
         [](StringView name, const Context& context) -> Vector<String>
         { return main_sel_first(context.selections()) |
                      transform([&buffer=context.buffer(), tabstop=context.options()["tabstop"].get<int>()](const Selection& sel) {
                          return selection_to_string(ColumnType::DisplayColumn, buffer, sel, tabstop);
-                     }) | gather<Vector>(); }
+                     }) | gather<Vector<String>>(); }
     }, {
         "selection_length", false,
         [](StringView name, const Context& context) -> Vector<String>
@@ -369,9 +390,9 @@ static const EnvVarDesc builtin_env_vars[] = { {
         "window_range", false,
         [](StringView name, const Context& context) -> Vector<String>
         {
-            auto setup = context.window().compute_display_setup(context);
-            return {format("{} {} {} {}", setup.first_line, setup.first_column,
-                                          setup.line_count, 0)};
+            const auto& setup = context.window().last_display_setup();
+            return {to_string(setup.first_line), to_string(setup.first_column),
+                    to_string(setup.line_count), to_string(0)};
         }
     }, {
         "history", false,
@@ -567,7 +588,8 @@ void register_options()
                        "    terminal_wheel_scroll_amount   int\n"
                        "    terminal_shift_function_key    int\n"
                        "    terminal_padding_char          codepoint\n"
-                       "    terminal_padding_fill          bool\n",
+                       "    terminal_padding_fill          bool\n"
+                       "    terminal_info_max_width        int\n",
                        UserInterface::Options{});
     reg.declare_option("modelinefmt", "format string used to generate the modeline",
                        "%val{bufname} %val{cursor_line}:%val{cursor_char_column} {{context_info}} {{mode_info}} - %val{client}@[%val{session}]"_str);
@@ -586,7 +608,6 @@ void register_options()
 }
 
 static Client* local_client = nullptr;
-static int local_client_exit = 0;
 static bool convert_to_client_pending = false;
 
 enum class UIType
@@ -625,6 +646,7 @@ std::unique_ptr<UserInterface> make_ui(UIType ui_type)
         void set_cursor(CursorMode, DisplayCoord) override {}
         void refresh(bool) override {}
         void set_on_key(OnKeyCallback) override {}
+        void set_on_paste(OnPasteCallback) override {}
         void set_ui_options(const Options&) override {}
     };
 
@@ -653,38 +675,7 @@ pid_t fork_server_to_background()
 
 std::unique_ptr<UserInterface> create_local_ui(UIType ui_type)
 {
-    if (ui_type != UIType::Terminal)
-        return make_ui(ui_type);
-
-    struct LocalUI : TerminalUI
-    {
-        LocalUI()
-        {
-            set_signal_handler(SIGTSTP, [](int) {
-                if (ClientManager::instance().count() == 1 and
-                    *ClientManager::instance().begin() == local_client)
-                    TerminalUI::instance().suspend();
-                else
-                    convert_to_client_pending = true;
-           });
-        }
-
-        ~LocalUI() override
-        {
-            local_client = nullptr;
-            if (convert_to_client_pending or
-                ClientManager::instance().empty())
-                return;
-
-            if (fork_server_to_background())
-            {
-                this->TerminalUI::~TerminalUI();
-                exit(local_client_exit);
-            }
-        }
-    };
-
-    if (not isatty(0))
+    if (ui_type == UIType::Terminal and not isatty(0))
     {
         // move stdin to another fd, and restore tty as stdin
         int fd = dup(0);
@@ -694,7 +685,19 @@ std::unique_ptr<UserInterface> create_local_ui(UIType ui_type)
         create_fifo_buffer("*stdin*", fd, Buffer::Flags::None);
     }
 
-    return std::make_unique<LocalUI>();
+    auto ui = make_ui(ui_type);
+
+    static SignalHandler old_handler = set_signal_handler(SIGTSTP, [](int sig) {
+        if (ClientManager::instance().count() == 1 and
+            *ClientManager::instance().begin() == local_client)
+            old_handler(sig);
+        else
+        {
+            convert_to_client_pending = true;
+            set_signal_handler(SIGTSTP, old_handler);
+        }
+    });
+    return ui;
 }
 
 int run_client(StringView session, StringView name, StringView client_init,
@@ -754,7 +757,7 @@ enum class ServerFlags
 constexpr bool with_bit_ops(Meta::Type<ServerFlags>) { return true; }
 
 int run_server(StringView session, StringView server_init,
-               StringView client_init, Optional<BufferCoord> init_coord,
+               StringView client_init, StringView init_buffer, Optional<BufferCoord> init_coord,
                ServerFlags flags, UIType ui_type, DebugFlags debug_flags,
                ConstArrayView<StringView> files)
 {
@@ -792,14 +795,11 @@ int run_server(StringView session, StringView server_init,
     write_to_debug_buffer("*** This is the debug buffer, where debug info will be written ***");
 
 #ifdef KAK_DEBUG
-    const auto start_time = Clock::now();
-    UnitTest::run_all_tests();
-
-    if (debug_flags & DebugFlags::Profile)
     {
-        using namespace std::chrono;
-        write_to_debug_buffer(format("running the unit tests took {} ms",
-                                     duration_cast<milliseconds>(Clock::now() - start_time).count()));
+        ProfileScope profile{debug_flags, [&](std::chrono::microseconds duration) {
+            write_to_debug_buffer(format("running the unit tests took {} ms", duration.count()));
+        }};
+        UnitTest::run_all_tests();
     }
 #endif
 
@@ -836,9 +836,7 @@ int run_server(StringView session, StringView server_init,
 
     if (not files.empty()) try
     {
-        // create buffers in reverse order so that the first given buffer
-        // is the most recently created one.
-        for (auto& file : files | reverse())
+        for (auto& file : files)
         {
             try
             {
@@ -862,13 +860,14 @@ int run_server(StringView session, StringView server_init,
          write_to_debug_buffer(format("error while opening command line files: {}", error.what()));
     }
 
+    int exit_status = 0;
     try
     {
         if (not server.is_daemon())
         {
             local_client = client_manager.create_client(
-                 create_local_ui(ui_type), getpid(), {}, get_env_vars(), client_init, std::move(init_coord),
-                 [](int status) { local_client_exit = status; });
+                 create_local_ui(ui_type), getpid(), {}, get_env_vars(), client_init, init_buffer, std::move(init_coord),
+                 [&](int status) { exit_status = status; });
 
             if (startup_error and local_client)
                 local_client->print_status({
@@ -888,12 +887,17 @@ int run_server(StringView session, StringView server_init,
             // Loop so that eventual inputs happening during the processing are handled as
             // well, avoiding unneeded redraws.
             bool allow_blocking = not client_manager.has_pending_inputs();
-            while (event_manager.handle_next_events(EventMode::Normal, nullptr, allow_blocking))
+            try
             {
-                if (client_manager.process_pending_inputs())
-                    break;
-                allow_blocking = false;
+                while (event_manager.handle_next_events(EventMode::Normal, nullptr, allow_blocking))
+                {
+                    if (client_manager.process_pending_inputs())
+                        break;
+                    allow_blocking = false;
+                }
             }
+            catch (const cancel&) {}
+
             client_manager.process_pending_inputs();
 
             client_manager.clear_client_trash();
@@ -902,24 +906,22 @@ int run_server(StringView session, StringView server_init,
             global_scope.option_registry().clear_option_trash();
 
             if (local_client and not contains(client_manager, local_client))
-                local_client = nullptr;
-            else if (local_client and not local_client->is_ui_ok())
             {
-                ClientManager::instance().remove_client(*local_client, false, -1);
                 local_client = nullptr;
-                if (not client_manager.empty() and fork_server_to_background())
-                    return 0;
+                if ((not client_manager.empty() or server.is_daemon()) and fork_server_to_background())
+                    exit(exit_status); // We do not want to run destructors and hooks here
             }
             else if (convert_to_client_pending)
             {
                 kak_assert(local_client);
                 auto& local_context = local_client->context();
-                const String client_name = local_context.name();
-                const String buffer_name = local_context.buffer().name();
-                const String selections = selection_list_to_string(ColumnType::Byte, local_context.selections());
+                String client_name = local_context.name();
+                String buffer_name = local_context.buffer().name();
+                String selections = selection_list_to_string(ColumnType::Byte, local_context.selections());
 
                 ClientManager::instance().remove_client(*local_client, true, 0);
                 client_manager.clear_client_trash();
+                local_client = nullptr;
                 convert_to_client_pending = false;
 
                 if (fork_server_to_background())
@@ -934,7 +936,7 @@ int run_server(StringView session, StringView server_init,
     }
     catch (const kill_session& kill)
     {
-        local_client_exit = kill.exit_status;
+        exit_status = kill.exit_status;
     }
 
     {
@@ -942,7 +944,7 @@ int run_server(StringView session, StringView server_init,
         global_scope.hooks().run_hook(Hook::KakEnd, "", empty_context);
     }
 
-    return local_client_exit;
+    return exit_status;
 }
 
 int run_filter(StringView keystr, ConstArrayView<StringView> files, bool quiet, StringView suffix_backup)
@@ -1073,29 +1075,28 @@ int main(int argc, char* argv[])
     set_signal_handler(SIGTTOU, SIG_IGN);
 
     const ParameterDesc param_desc{
-        SwitchMap{ { "c", { true,  "connect to given session" } },
-                   { "e", { true,  "execute argument on client initialisation" } },
-                   { "E", { true,  "execute argument on server initialisation" } },
-                   { "n", { false, "do not source kakrc files on startup" } },
-                   { "s", { true,  "set session name" } },
-                   { "d", { false, "run as a headless session (requires -s)" } },
-                   { "p", { true,  "just send stdin as commands to the given session" } },
-                   { "f", { true,  "filter: for each file, select the entire buffer and execute the given keys" } },
-                   { "i", { true, "backup the files on which a filter is applied using the given suffix" } },
-                   { "q", { false, "in filter mode, be quiet about errors applying keys" } },
-                   { "ui", { true, "set the type of user interface to use (terminal, dummy, or json)" } },
-                   { "l", { false, "list existing sessions" } },
-                   { "clear", { false, "clear dead sessions" } },
-                   { "debug", { true, "initial debug option value" } },
-                   { "version", { false, "display kakoune version and exit" } },
-                   { "ro", { false, "readonly mode" } },
-                   { "help", { false, "display a help message and quit" } } }
+        SwitchMap{ { "c", { ArgCompleter{},  "connect to given session" } },
+                   { "e", { ArgCompleter{},  "execute argument on client initialisation" } },
+                   { "E", { ArgCompleter{},  "execute argument on server initialisation" } },
+                   { "n", { {}, "do not source kakrc files on startup" } },
+                   { "s", { ArgCompleter{},  "set session name" } },
+                   { "d", { {}, "run as a headless session (requires -s)" } },
+                   { "p", { ArgCompleter{},  "just send stdin as commands to the given session" } },
+                   { "f", { ArgCompleter{},  "filter: for each file, select the entire buffer and execute the given keys" } },
+                   { "i", { ArgCompleter{}, "backup the files on which a filter is applied using the given suffix" } },
+                   { "q", { {}, "in filter mode, be quiet about errors applying keys" } },
+                   { "ui", { ArgCompleter{}, "set the type of user interface to use (terminal, dummy, or json)" } },
+                   { "l", { {}, "list existing sessions" } },
+                   { "clear", { {}, "clear dead sessions" } },
+                   { "debug", { ArgCompleter{}, "initial debug option value" } },
+                   { "version", { {}, "display kakoune version and exit" } },
+                   { "ro", { {}, "readonly mode" } },
+                   { "help", { {}, "display a help message and quit" } } }
     };
 
     try
     {
-        auto show_usage = [&]()
-        {
+        auto show_usage = [&]() {
             write_stdout(format("Usage: {} [options] [file]... [+<line>[:<col>]|+:]\n\n"
                     "Options:\n"
                     "{}\n"
@@ -1212,7 +1213,7 @@ int main(int argc, char* argv[])
             }
             String new_files;
             for (auto name : files) {
-                new_files += format("edit '{}'", escape(real_path(name), "'", '\\'));
+                new_files += format("edit '{}'", escape(real_path(name), "'", '\''));
                 if (init_coord) {
                     new_files += format(" {} {}", init_coord->line + 1, init_coord->column + 1);
                     init_coord.reset();
@@ -1234,7 +1235,7 @@ int main(int argc, char* argv[])
                              ((argc == 1 or (ignore_kakrc and argc == 2))
                               and isatty(0)                               ? ServerFlags::StartupInfo : ServerFlags::None);
                 auto debug_flags = option_from_string(Meta::Type<DebugFlags>{}, parser.get_switch("debug").value_or(""));
-                return run_server(session, server_init, client_init, init_coord, flags, ui_type, debug_flags, files);
+                return run_server(session, server_init, client_init, files.empty() ? StringView{} : files[0], init_coord, flags, ui_type, debug_flags, files);
             }
             catch (convert_to_client_mode& convert)
             {

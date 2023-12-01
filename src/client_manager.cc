@@ -47,11 +47,16 @@ String ClientManager::generate_name() const
 
 Client* ClientManager::create_client(std::unique_ptr<UserInterface>&& ui, int pid,
                                      String name, EnvVarMap env_vars, StringView init_cmds,
-                                     Optional<BufferCoord> init_coord,
+                                     StringView init_buffer, Optional<BufferCoord> init_coord,
                                      Client::OnExitCallback on_exit)
 {
-    Buffer& buffer = BufferManager::instance().get_first_buffer();
-    WindowAndSelections ws = get_free_window(buffer);
+    Buffer* buffer = nullptr;
+    if (not init_buffer.empty())
+        buffer = BufferManager::instance().get_buffer_ifp(init_buffer);
+    if (buffer == nullptr)
+        buffer = &BufferManager::instance().get_first_buffer();
+
+    WindowAndSelections ws = get_free_window(*buffer);
     Client* client = new Client{std::move(ui), std::move(ws.window),
                                 std::move(ws.selections), pid,
                                 std::move(env_vars),
@@ -62,7 +67,7 @@ Client* ClientManager::create_client(std::unique_ptr<UserInterface>&& ui, int pi
     if (init_coord)
     {
         auto& selections = client->context().selections_write_only();
-        selections = SelectionList(buffer, buffer.clamp(*init_coord));
+        selections = SelectionList(*buffer, buffer->clamp(*init_coord));
         client->context().window().center_line(init_coord->line);
     }
 
@@ -147,7 +152,6 @@ WindowAndSelections ClientManager::get_free_window(Buffer& buffer)
     if (it == m_free_windows.rend())
         return { std::make_unique<Window>(buffer), { buffer, Selection{} } };
 
-    it->window->force_redraw();
     WindowAndSelections res = std::move(*it);
     m_free_windows.erase(it.base()-1);
     res.selections.update();

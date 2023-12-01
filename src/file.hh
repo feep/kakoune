@@ -39,6 +39,7 @@ bool fd_readable(int fd);
 bool fd_writable(int fd);
 String read_fd(int fd, bool text = false);
 String read_file(StringView filename, bool text = false);
+template<bool force_blocking = false>
 void write(int fd, StringView data);
 void write_to_file(StringView filename, StringView data);
 
@@ -102,11 +103,6 @@ constexpr bool operator==(const timespec& lhs, const timespec& rhs)
     return lhs.tv_sec == rhs.tv_sec and lhs.tv_nsec == rhs.tv_nsec;
 }
 
-constexpr bool operator!=(const timespec& lhs, const timespec& rhs)
-{
-    return not (lhs == rhs);
-}
-
 enum class FilenameFlags
 {
     None = 0,
@@ -121,7 +117,7 @@ CandidateList complete_filename(StringView prefix, const Regex& ignore_regex,
 
 CandidateList complete_command(StringView prefix, ByteCount cursor_pos = -1);
 
-template<int buffer_size = 4096>
+template<bool atomic, int buffer_size = 4096>
 struct BufferedWriter
 {
     BufferedWriter(int fd)
@@ -139,7 +135,7 @@ struct BufferedWriter
         {
             const ByteCount length = data.length();
             const ByteCount write_len = std::min(length, size - m_pos);
-            memcpy(m_buffer + (int)m_pos, data.data(), (int)write_len);
+            memcpy(m_buffer + m_pos, data.data(), (int)write_len);
             m_pos += write_len;
             if (m_pos == size)
                 flush();
@@ -149,7 +145,7 @@ struct BufferedWriter
 
     void flush()
     {
-        Kakoune::write(m_fd, {m_buffer, m_pos});
+        Kakoune::write<atomic>(m_fd, {m_buffer, m_pos});
         m_pos = 0;
     }
 

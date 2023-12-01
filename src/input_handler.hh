@@ -31,6 +31,7 @@ enum class PromptEvent
     Validate
 };
 using PromptCallback = std::function<void (StringView, PromptEvent, Context&)>;
+
 enum class PromptFlags
 {
     None = 0,
@@ -39,7 +40,6 @@ enum class PromptFlags
     Search = 1 << 2,
 };
 constexpr bool with_bit_ops(Meta::Type<PromptFlags>) { return true; }
-
 
 using KeyCallback = std::function<void (Key, Context&)>;
 
@@ -72,6 +72,8 @@ public:
     void insert(InsertMode mode, int count);
     // repeat last insert mode key sequence
     void repeat_last_insert();
+    // insert a string without affecting the mode stack
+    void paste(StringView content);
 
     // enter prompt mode, callback is called on each change,
     // abort or validation with corresponding PromptEvent value
@@ -81,6 +83,7 @@ public:
                 Face prompt_face, PromptFlags flags, char history_register,
                 PromptCompleter completer, PromptCallback callback);
     void set_prompt_face(Face prompt_face);
+    bool history_enabled() const;
 
     // enter menu mode, callback is called on each selection change,
     // abort or validation with corresponding MenuEvent value
@@ -95,6 +98,8 @@ public:
 
     // process the given key
     void handle_key(Key key);
+
+    void refresh_ifn();
 
     void start_recording(char reg);
     bool is_recording() const;
@@ -196,12 +201,18 @@ void on_next_key_with_autoinfo(const Context& context, StringView mode_name,
             bool hide = should_show_info(AutoInfo::OnKey, context);
             hide_auto_info_ifn(context, hide);
             cmd(key, context);
-    }, [&context, title=std::move(title), info=std::move(info)](Timer&) {
+        }, [&context, title=std::move(title), info=std::move(info)](Timer&) {
            show_auto_info_ifn(title, info, AutoInfo::OnKey, context);
-    });
+        });
 }
 
-void scroll_window(Context& context, LineCount offset, bool mouse_dragging = false);
+enum class OnHiddenCursor {
+    PreserveSelections,
+    MoveCursor,
+    MoveCursorAndAnchor,
+};
+
+void scroll_window(Context& context, LineCount offset, OnHiddenCursor on_hidden_cursor);
 
 }
 

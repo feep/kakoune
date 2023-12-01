@@ -46,19 +46,29 @@ Client::Client(std::unique_ptr<UserInterface>&& ui,
 
     m_ui->set_ui_options(m_window->options()["ui_options"].get<UserInterface::Options>());
     m_ui->set_on_key([this](Key key) {
+        kak_assert(key != Key::Invalid);
         if (key == ctrl('.'))
         {
             auto prev_handler = set_signal_handler(SIGINT, SIG_IGN);
             killpg(getpgrp(), SIGINT);
             set_signal_handler(SIGINT, prev_handler);
         }
+        else if (key == ctrl('g'))
+        {
+            m_pending_keys.clear();
+            print_status({"operation cancelled", context().faces()["Error"]});
+            throw cancel{};
+        }
         else if (key.modifiers & Key::Modifiers::Resize)
         {
             m_window->set_dimensions(key.coord());
-            force_redraw();
+            force_redraw(true);
         }
         else
             m_pending_keys.push_back(key);
+    });
+    m_ui->set_on_paste([this](StringView content) {
+        context().input_handler().paste(content);
     });
 
     m_window->hooks().run_hook(Hook::WinDisplay, m_window->buffer().name(), context());
@@ -99,14 +109,17 @@ bool Client::process_pending_inputs()
             else if (key == Key::FocusOut)
                 context().hooks().run_hook(Hook::FocusOut, context().name(), context());
             else
+            {
+                context().ensure_cursor_visible = true;
                 m_input_handler.handle_key(key);
+            }
 
             context().hooks().run_hook(Hook::RawKey, to_string(key), context());
         }
         catch (Kakoune::runtime_error& error)
         {
             write_to_debug_buffer(format("Error: {}", error.what()));
-            context().print_status({error.what().str(), context().faces()["Error"] });
+            context().print_status({error.what().str(), context().faces()["Error"]});
             context().hooks().run_hook(Hook::RuntimeError, error.what(), context());
         }
     }
@@ -200,7 +213,7 @@ void Client::change_buffer(Buffer& buffer, Optional<FunctionRef<void()>> set_sel
     m_ui->set_ui_options(m_window->options()["ui_options"].get<UserInterface::Options>());
 
     m_window->hooks().run_hook(Hook::WinDisplay, buffer.name(), context());
-    force_redraw();
+    force_redraw(true);
 }
 
 static bool is_inline(InfoStyle style)
@@ -265,7 +278,8 @@ void Client::redraw_ifn()
 
     if (m_ui_pending & InfoShow and m_info.ui_anchor)
         m_ui->info_show(m_info.title, m_info.content, *m_info.ui_anchor,
-                        faces["Information"], m_info.style);
+                        faces[(is_inline(m_info.style) || m_info.style == InfoStyle::MenuDoc)
+                        ? "InlineInformation" : "Information"], m_info.style);
     if (m_ui_pending & InfoHide)
         m_ui->info_hide();
 
@@ -279,11 +293,14 @@ void Client::redraw_ifn()
     m_ui_pending = 0;
 }
 
-void Client::force_redraw()
+void Client::force_redraw(bool full)
 {
-    m_ui_pending |= Refresh | Draw | StatusLine |
-        (m_menu.items.empty() ? MenuHide : MenuShow | MenuSelect) |
-        (m_info.content.empty() ? InfoHide : InfoShow);
+    if (full)
+        m_ui_pending |= Refresh | Draw | StatusLine |
+            (m_menu.items.empty() ? MenuHide : MenuShow | MenuSelect) |
+            (m_info.content.empty() ? InfoHide : InfoShow);
+    else
+        m_ui_pending |= Draw;
 }
 
 void Client::reload_buffer()
@@ -367,31 +384,38 @@ void Client::check_if_buffer_needs_reloading()
     if (not (buffer.flags() & Buffer::Flags::File) or reload == Autoreload::No)
         return;
 
-    const String& filename = buffer.name();
-    const timespec ts = get_fs_timestamp(filename);
-    const auto status = buffer.fs_status();
-
-    if (ts == InvalidTime or ts == status.timestamp)
-        return;
-
-    if (MappedFile fd{filename};
-        fd.st.st_size == status.file_size and hash_data(fd.data, fd.st.st_size) == status.hash)
-        return;
-
-    if (reload == Autoreload::Ask)
+    try
     {
-        StringView bufname = buffer.display_name();
-        info_show(format("reload '{}' ?", bufname),
-                  format("'{}' was modified externally\n"
-                         " y, <ret>: reload | n, <esc>: keep\n"
-                         " Y: always reload | N: always keep\n",
-                         bufname), {}, InfoStyle::Modal);
+        const String& filename = buffer.name();
+        const timespec ts = get_fs_timestamp(filename);
+        const auto status = buffer.fs_status();
 
-        m_buffer_reload_dialog_opened = true;
-        m_input_handler.on_next_key("buffer-reload", KeymapMode::None, [this](Key key, Context&){ on_buffer_reload_key(key); });
+        if (ts == InvalidTime or ts == status.timestamp)
+            return;
+
+        if (MappedFile fd{filename};
+            fd.st.st_size == status.file_size and hash_data(fd.data, fd.st.st_size) == status.hash)
+            return;
+
+        if (reload == Autoreload::Ask)
+        {
+            StringView bufname = buffer.display_name();
+            info_show(format("reload '{}' ?", bufname),
+                      format("'{}' was modified externally\n"
+                             " y, <ret>: reload | n, <esc>: keep\n"
+                             " Y: always reload | N: always keep\n",
+                             bufname), {}, InfoStyle::Modal);
+
+            m_buffer_reload_dialog_opened = true;
+            m_input_handler.on_next_key("buffer-reload", KeymapMode::None, [this](Key key, Context&){ on_buffer_reload_key(key); });
+        }
+        else
+            reload_buffer();
     }
-    else
-        reload_buffer();
+    catch (Kakoune::runtime_error& error)
+    {
+        write_to_debug_buffer(format("Error while checking if buffer {} changed: {}", buffer.name(), error.what()));
+    }
 }
 
 StringView Client::get_env_var(StringView name) const
@@ -405,10 +429,8 @@ StringView Client::get_env_var(StringView name) const
 void Client::on_option_changed(const Option& option)
 {
     if (option.name() == "ui_options")
-    {
         m_ui->set_ui_options(option.get<UserInterface::Options>());
-        m_ui_pending |= Draw;
-    }
+    m_ui_pending |= Draw; // a highlighter might depend on the option, so we need to redraw
 }
 
 void Client::menu_show(Vector<DisplayLine> choices, BufferCoord anchor, MenuStyle style)

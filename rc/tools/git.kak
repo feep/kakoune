@@ -1,6 +1,18 @@
 declare-option -docstring "name of the client in which documentation is to be displayed" \
     str docsclient
 
+declare-option -docstring "git diff added character" \
+    str git_diff_add_char "▏"
+
+declare-option -docstring "git diff modified character" \
+    str git_diff_mod_char "▏"
+
+declare-option -docstring "git diff deleted character" \
+    str git_diff_del_char "_"
+
+declare-option -docstring "git diff top deleted character" \
+    str git_diff_top_char "‾"
+
 hook -group git-log-highlight global WinSetOption filetype=git-log %{
     require-module diff
     add-highlighter window/git-log group
@@ -49,7 +61,9 @@ define-command -params 1.. \
         All the optional arguments are forwarded to the git utility
         Available commands:
             add
+            apply (alias for "patch git apply")
             rm
+            reset
             blame
             commit
             checkout
@@ -59,20 +73,22 @@ define-command -params 1.. \
             init
             log
             next-hunk
-            previous-hunk
+            prev-hunk
             show
             show-branch
             show-diff
             status
             update-diff
+            grep
     } -shell-script-candidates %{
     if [ $kak_token_to_complete -eq 0 ]; then
-        printf "add\nrm\nblame\ncommit\ncheckout\ndiff\nhide-blame\nhide-diff\nlog\nnext-hunk\nprev-hunk\nshow\nshow-branch\nshow-diff\ninit\nstatus\nupdate-diff\n"
+        printf "add\napply\nrm\nreset\nblame\ncommit\ncheckout\ndiff\nhide-blame\nhide-diff\nlog\nnext-hunk\nprev-hunk\nshow\nshow-branch\nshow-diff\ninit\nstatus\nupdate-diff\ngrep\nedit\n"
     else
         case "$1" in
             commit) printf -- "--amend\n--no-edit\n--all\n--reset-author\n--fixup\n--squash\n"; git ls-files -m ;;
             add) git ls-files -dmo --exclude-standard ;;
-            rm) git ls-files -c ;;
+            apply) printf -- "--reverse\n--cached\n--index\n" ;;
+            grep|edit) git ls-files -c --recurse-submodules ;;
         esac
     fi
   } \
@@ -93,7 +109,7 @@ define-command -params 1.. \
            diff) map_diff_goto_source=true; filetype=diff ;;
            show) map_diff_goto_source=true; filetype=git-log ;;
            show-branch) filetype=git-show-branch ;;
-           log)  filetype=git-log ;;
+           log)  map_diff_goto_source=true; filetype=git-log ;;
            status)  filetype=git-status ;;
            *) return 1 ;;
         esac
@@ -149,11 +165,7 @@ define-command -params 1.. \
                       count=$4
                   }
                   /^author / { authors[sha]=substr($0,8) }
-                  /^author-time ([0-9]*)/ {
-                       cmd = "date -d @" $2 " +\"%F %T\""
-                       cmd | getline dates[sha]
-                       close(cmd)
-                  }
+                  /^author-time ([0-9]*)/ { dates[sha]=strftime("%F %T", $2) }
                   END { send_flags(1); }'
         ) > /dev/null 2>&1 < /dev/null &
     }
@@ -170,7 +182,12 @@ define-command -params 1.. \
         (
             cd_bufdir
             git --no-pager diff --no-ext-diff -U0 "$kak_buffile" | perl -e '
+            use utf8;
             $flags = $ENV{"kak_timestamp"};
+            $add_char = $ENV{"kak_opt_git_diff_add_char"};
+            $del_char = $ENV{"kak_opt_git_diff_del_char"};
+            $top_char = $ENV{"kak_opt_git_diff_top_char"};
+            $mod_char = $ENV{"kak_opt_git_diff_mod_char"};
             foreach $line (<STDIN>) {
                 if ($line =~ /@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))?/) {
                     $from_line = $1;
@@ -181,39 +198,39 @@ define-command -params 1.. \
                     if ($from_count == 0 and $to_count > 0) {
                         for $i (0..$to_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{green\}▋";
+                            $flags .= " $line|\{green\}$add_char";
                         }
                     }
                     elsif ($from_count > 0 and $to_count == 0) {
                         if ($to_line == 0) {
-                            $flags .= " 1|\{red\}🬿";
+                            $flags .= " 1|\{red\}$top_char";
                         } else {
-                            $flags .= " $to_line|\{red\}🭚";
+                            $flags .= " $to_line|\{red\}$del_char";
                         }
                     }
                     elsif ($from_count > 0 and $from_count == $to_count) {
                         for $i (0..$to_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{blue\}▋";
+                            $flags .= " $line|\{blue\}$mod_char";
                         }
                     }
                     elsif ($from_count > 0 and $from_count < $to_count) {
                         for $i (0..$from_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{blue\}▋";
+                            $flags .= " $line|\{blue\}$mod_char";
                         }
                         for $i ($from_count..$to_count - 1) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{green\}▋";
+                            $flags .= " $line|\{green\}$add_char";
                         }
                     }
                     elsif ($to_count > 0 and $from_count > $to_count) {
                         for $i (0..$to_count - 2) {
                             $line = $to_line + $i;
-                            $flags .= " $line|\{blue\}▋";
+                            $flags .= " $line|\{blue\}$mod_char";
                         }
                         $last = $to_line + $to_count - 1;
-                        $flags .= " $last|\{blue}▋";
+                        $flags .= " $last|\{blue+u\}$mod_char";
                     }
                 }
             }
@@ -227,7 +244,7 @@ define-command -params 1.. \
         shift
 
         if [ $# -lt 1 ]; then
-            echo "fail 'no git hunks found'"
+            echo "fail 'no git hunks found, try \":git show-diff\" first'"
             exit
         fi
 
@@ -311,6 +328,12 @@ define-command -params 1.. \
     }
 
     case "$1" in
+        apply)
+            shift
+            enquoted="$(printf '"%s" ' "$@")"
+            echo "require-module patch"
+            echo "patch git apply $enquoted"
+            ;;
         show|show-branch|log|diff|status)
             show_git_cmd_output "$@"
             ;;
@@ -349,6 +372,20 @@ define-command -params 1.. \
             ;;
         reset|checkout)
             run_git_cmd "$@"
+            ;;
+        grep)
+            shift
+            enquoted="$(printf '"%s" ' "$@")"
+            printf %s "try %{
+                set-option current grepcmd 'git grep -n --column'
+                grep $enquoted
+                set-option current grepcmd '$kak_opt_grepcmd'
+            }"
+            ;;
+        edit)
+            shift
+            enquoted="$(printf '"%s" ' "$@")"
+            printf %s "edit -existing -- $enquoted"
             ;;
         *)
             printf "fail unknown git command '%s'\n" "$1"

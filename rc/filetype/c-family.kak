@@ -122,19 +122,25 @@ define-command -hidden c-family-indent-on-opening-curly-brace %[
 ]
 
 define-command -hidden c-family-indent-on-closing-curly-brace %[
-    # align to opening curly brace when alone on a line
-    try %[
-        # in case open curly brace follows a closing paren, align indent with opening paren
-        execute-keys -itersel -draft <a-h><a-:><a-k>^\h+\}$<ret>hm <a-F>)M <a-k> \A\(.*\)\h\{.*\}\z <ret> <a-S>1<a-&>
-    ] catch %[
-        # otherwise align with open curly brace
-        execute-keys -itersel -draft <a-h><a-:><a-k>^\h+\}$<ret>hm<a-S>1<a-&>
-    ] catch %[]
+    evaluate-commands -draft -itersel -verbatim try %[
+        # check if alone on the line and select to opening curly brace
+        execute-keys <a-h><a-:><a-k>^\h+\}$<ret>hm
+        try %[
+            # in case open curly brace follows a closing paren possibly with qualifiers, extend to opening paren
+            execute-keys -draft <a-f>) <a-k> \A\)(\h+\w+)*\h*\{\z <ret>
+            execute-keys <a-F>)M
+        ]
+        # align to selection start
+        execute-keys <a-S>1<a-&>
+    ]
 ]
 
 define-command -hidden c-family-insert-on-closing-curly-brace %[
     # add a semicolon after a closing brace if part of a class, union or struct definition
-    try %[ execute-keys -itersel -draft hmxBx <a-K>\A[^\n]+\)\h*(\{|$)<ret> <a-k>\A\h*(class|struct|union|enum)<ret> '<a-;>;i;<esc>' ]
+    evaluate-commands -itersel -draft -verbatim try %[
+        execute-keys -draft hmh <a-?>\b(class|struct|union|enum)\b<ret> <a-K>\{<ret> <a-K>\)(\s+\w+)*\s*\z<ret>
+        execute-keys -draft ';i;<esc>'
+    ]
 ]
 
 define-command -hidden c-family-insert-on-newline %[ evaluate-commands -itersel -draft %[

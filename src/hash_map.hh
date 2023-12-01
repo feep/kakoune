@@ -194,9 +194,9 @@ struct HashMap
             insert(*begin++);
     }
 
-    constexpr EffectiveValue& insert(Item item)
+    constexpr EffectiveValue& insert(Item item, size_t hash)
     {
-        const auto hash = hash_value(item_key(item));
+        kak_assert(hash == hash_value(item_key(item)));
         if constexpr (not multi_key)
         {
             if (auto index = find_index(item_key(item), hash); index >= 0)
@@ -210,6 +210,12 @@ struct HashMap
         m_index.add(hash, (int)m_items.size());
         m_items.push_back(std::move(item));
         return item_value(m_items.back());
+    }
+
+    constexpr EffectiveValue& insert(Item item)
+    {
+        const auto hash = hash_value(item_key(item));
+        return insert(std::move(item), hash);
     }
 
     template<typename KeyType> requires IsHashCompatible<Key, KeyType>
@@ -313,6 +319,7 @@ struct HashMap
     constexpr const_iterator begin() const { return m_items.begin(); }
     constexpr const_iterator end() const { return m_items.end(); }
 
+    Item& item(size_t index) { return m_items[index]; }
     const Item& item(size_t index) const { return m_items[index]; }
 
     template<typename KeyType> requires IsHashCompatible<Key, KeyType>
@@ -326,6 +333,15 @@ struct HashMap
     constexpr const_iterator find(const KeyType& key) const
     {
         return const_cast<HashMap*>(this)->find(key);
+    }
+
+    constexpr void remove(const const_iterator& it)
+    {
+        auto index = it - m_items.begin();
+        const auto hash = hash_value(it->key);
+        m_index.remove(hash, index);
+        m_items.erase(it);
+        m_index.ordered_fix_entries(index);
     }
 
     constexpr void clear() { m_items.clear(); m_index.clear(); }
@@ -343,12 +359,6 @@ struct HashMap
     constexpr bool operator==(const HashMap<Key, Value, otherDomain, Container>& other) const
     {
         return size() == other.size() and std::equal(begin(), end(), other.begin());
-    }
-
-    template<MemoryDomain otherDomain>
-    constexpr bool operator!=(const HashMap<Key, Value, otherDomain, Container>& other) const
-    {
-        return not (*this == other);
     }
 
 private:

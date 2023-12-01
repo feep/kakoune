@@ -19,6 +19,8 @@ class DisplayLine;
 class KeymapManager;
 class AliasRegistry;
 
+enum Direction { Backward = -1, Forward = 1 };
+
 struct JumpList
 {
     void push(SelectionList jump, Optional<size_t> index = {});
@@ -26,12 +28,7 @@ struct JumpList
     const SelectionList& backward(Context& context, int count);
     void forget_buffer(Buffer& buffer);
 
-    friend bool operator==(const JumpList& lhs, const JumpList& rhs)
-    {
-        return lhs.m_jumps == rhs.m_jumps and lhs.m_current == rhs.m_current;
-    }
-
-    friend bool operator!=(const JumpList& lhs, const JumpList& rhs) { return not (lhs == rhs); }
+    friend bool operator==(const JumpList& lhs, const JumpList& rhs) = default;
 
     size_t current_index() const { return m_current; }
 
@@ -91,8 +88,8 @@ public:
     SelectionList& selections_write_only();
 
     void end_selection_edition() { m_selection_history.end_edition(); }
+    template<Direction direction>
     void undo_selection_change();
-    void redo_selection_change();
 
     void change_buffer(Buffer& buffer, Optional<FunctionRef<void()>> set_selection = {});
     void forget_buffer(Buffer& buffer);
@@ -117,7 +114,6 @@ public:
 
     bool is_editing() const { return m_edition_level!= 0; }
     void disable_undo_handling() { m_edition_level = -1; }
-    bool is_editing_selection() const { return m_selection_history.in_edition(); }
 
     NestedBool& hooks_disabled() { return m_hooks_disabled; }
     const NestedBool& hooks_disabled() const { return m_hooks_disabled; }
@@ -125,8 +121,8 @@ public:
     NestedBool& keymaps_disabled() { return m_keymaps_disabled; }
     const NestedBool& keymaps_disabled() const { return m_keymaps_disabled; }
 
-    NestedBool& history_disabled() { return m_history_disabled; }
-    const NestedBool& history_disabled() const { return m_history_disabled; }
+    NestedBool& noninteractive() { return m_noninteractive; }
+    const NestedBool& noninteractive() const { return m_noninteractive; }
 
     Flags flags() const { return m_flags; }
 
@@ -143,6 +139,8 @@ public:
     void repeat_last_select() { if (m_last_select) m_last_select(*this); }
 
     Buffer* last_buffer() const;
+
+    bool ensure_cursor_visible = true;
 private:
     void begin_edition();
     void end_edition();
@@ -170,8 +168,8 @@ private:
         void end_edition();
         bool in_edition() const { return m_in_edition; }
 
+        template<Direction direction>
         void undo();
-        void redo();
         void forget_buffer(Buffer& buffer);
     private:
         enum class HistoryId : size_t { First = 0, Invalid = (size_t)-1 };
@@ -206,7 +204,7 @@ private:
 
     NestedBool m_hooks_disabled;
     NestedBool m_keymaps_disabled;
-    NestedBool m_history_disabled;
+    NestedBool m_noninteractive;
 };
 
 struct ScopedEdition
@@ -228,7 +226,7 @@ struct ScopedSelectionEdition
 {
     ScopedSelectionEdition(Context& context)
         : m_context{context},
-          m_buffer{context.has_buffer() ? &context.buffer() : nullptr}
+          m_buffer{not (m_context.flags() & Context::Flags::Draft) and context.has_buffer() ? &context.buffer() : nullptr}
     { if (m_buffer) m_context.m_selection_history.begin_edition(); }
     ScopedSelectionEdition(ScopedSelectionEdition&& other) : m_context{other.m_context}, m_buffer{other.m_buffer}
     { other.m_buffer = nullptr; }

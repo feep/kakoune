@@ -43,6 +43,7 @@ enum class MessageType : uint8_t
     SetOptions,
     Exit,
     Key,
+    Paste,
 };
 
 class MsgWriter
@@ -413,6 +414,9 @@ public:
     void set_on_key(OnKeyCallback callback) override
     { m_on_key = std::move(callback); }
 
+    void set_on_paste(OnPasteCallback callback) override
+    { m_on_paste = std::move(callback); }
+
     void set_ui_options(const Options& options) override;
 
     void exit(int status);
@@ -430,6 +434,7 @@ private:
     MsgReader     m_reader;
     DisplayCoord  m_dimensions;
     OnKeyCallback m_on_key;
+    OnPasteCallback m_on_paste;
     RemoteBuffer  m_send_buffer;
 };
 
@@ -479,17 +484,25 @@ RemoteUI::RemoteUI(int socket, DisplayCoord dimensions)
                   if (not m_reader.ready())
                       continue;
 
-                   if (m_reader.type() != MessageType::Key)
+                   if (m_reader.type() == MessageType::Key)
+                   {
+                       auto key = m_reader.read<Key>();
+                       m_reader.reset();
+                       if (key.modifiers == Key::Modifiers::Resize)
+                           m_dimensions = key.coord();
+                       m_on_key(key);
+                   }
+                   else if (m_reader.type() == MessageType::Paste)
+                   {
+                       auto content = m_reader.read<String>();
+                       m_reader.reset();
+                       m_on_paste(content);
+                   }
+                   else
                    {
                        m_socket_watcher.close_fd();
                        return;
                    }
-
-                   auto key = m_reader.read<Key>();
-                   m_reader.reset();
-                   if (key.modifiers == Key::Modifiers::Resize)
-                       m_dimensions = key.coord();
-                   m_on_key(key);
               }
           }
           catch (const disconnected& err)
@@ -660,6 +673,11 @@ RemoteClient::RemoteClient(StringView session, StringView name, std::unique_ptr<
         msg.write(key);
         m_socket_watcher->events() |= FdEvents::Write;
      });
+    m_ui->set_on_paste([this](StringView content){
+        MsgWriter msg(m_send_buffer, MessageType::Paste);
+        msg.write(content);
+        m_socket_watcher->events() |= FdEvents::Write;
+     });
 
     m_socket_watcher.reset(new FDWatcher{sock, FdEvents::Read | FdEvents::Write, EventMode::Urgent,
                            [this, reader = MsgReader{}](FDWatcher& watcher, FdEvents events, EventMode) mutable {
@@ -758,7 +776,7 @@ class Server::Accepter
 {
 public:
     Accepter(int socket)
-        : m_socket_watcher(socket, FdEvents::Read, EventMode::Urgent,
+        : m_socket_watcher(socket, FdEvents::Read, EventMode::Normal,
                            [this](FDWatcher&, FdEvents, EventMode mode) {
                                handle_available_input(mode);
                            })
@@ -793,7 +811,7 @@ private:
                 auto* ui = new RemoteUI{sock, dimensions};
                 ClientManager::instance().create_client(
                     std::unique_ptr<UserInterface>(ui), pid, std::move(name),
-                    std::move(env_vars), init_cmds, init_coord,
+                    std::move(env_vars), init_cmds, {}, init_coord,
                     [ui](int status) { ui->exit(status); });
 
                 Server::instance().remove_accepter(this);

@@ -10,6 +10,8 @@
 #include "string.hh"
 #include "string_utils.hh"
 
+#include <functional>
+
 namespace Kakoune
 {
 
@@ -37,9 +39,15 @@ struct wrong_argument_count : public parameter_error
     wrong_argument_count() : parameter_error("wrong argument count") {}
 };
 
+class Context;
+struct Completions;
+enum class CompletionFlags;
+using ArgCompleter = std::function<Completions (const Context&, CompletionFlags,
+                                                StringView, ByteCount)>;
+
 struct SwitchDesc
 {
-    bool takes_arg;
+    Optional<ArgCompleter> arg_completer;
     String description;
 };
 
@@ -74,7 +82,13 @@ struct ParametersParser
     // the options defines named options, if they map to true, then
     // they are understood as string options, else they are understood as
     // boolean option.
-    ParametersParser(ParameterList params, const ParameterDesc& desc);
+    ParametersParser(ParameterList params, const ParameterDesc& desc, bool ignore_errors = false);
+
+    enum class State {
+        Switch,
+        SwitchArgument,
+        Positional,
+    };
 
     // Return a valid optional if the switch was given, with
     // a non empty StringView value if the switch took an argument.
@@ -103,11 +117,6 @@ struct ParametersParser
             return m_index == other.m_index;
         }
 
-        bool operator!=(const iterator& other) const
-        {
-            return not (*this == other);
-        }
-
     private:
         const ParametersParser& m_parser;
         size_t                  m_index;
@@ -132,10 +141,13 @@ struct ParametersParser
     iterator begin() const { return iterator(*this, 0); }
     iterator end() const { return iterator(*this, m_positional_indices.size()); }
 
+    State state() const { return *m_state; }
+
 private:
     ParameterList m_params;
     Vector<size_t, MemoryDomain::Commands> m_positional_indices;
     HashMap<String, StringView> m_switches;
+    Optional<State> m_state;
 };
 
 }

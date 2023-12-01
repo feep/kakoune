@@ -221,36 +221,36 @@ void Buffer::reload(BufferLines lines, ByteOrderMark bom, EolFormat eolformat, F
 
         auto it = m_lines.begin();
         auto new_it = lines.begin();
-        for (auto& d : diff)
+        for (auto& [op, len] : diff)
         {
-            if (d.op == DiffOp::Keep)
+            if (op == DiffOp::Keep)
             {
-                it += d.len;
-                new_it += d.len;
+                it += len;
+                new_it += len;
             }
-            else if (d.op == DiffOp::Add)
+            else if (op == DiffOp::Add)
             {
                 const LineCount cur_line = (int)(it - m_lines.begin());
 
-                for (LineCount line = 0; line < d.len; ++line)
+                for (LineCount line = 0; line < len; ++line)
                     m_current_undo_group.push_back({Modification::Insert, cur_line + line, *(new_it + (int)line)});
 
-                m_changes.push_back({Change::Insert, cur_line, cur_line + d.len});
-                m_lines.insert(it, new_it, new_it + d.len);
-                it = m_lines.begin() + (int)(cur_line + d.len);
-                new_it += d.len;
+                m_changes.push_back({Change::Insert, cur_line, cur_line + len});
+                m_lines.insert(it, new_it, new_it + len);
+                it = m_lines.begin() + (int)(cur_line + len);
+                new_it += len;
             }
-            else if (d.op == DiffOp::Remove)
+            else if (op == DiffOp::Remove)
             {
                 const LineCount cur_line = (int)(it - m_lines.begin());
 
-                for (LineCount line = d.len-1; line >= 0; --line)
+                for (LineCount line = len-1; line >= 0; --line)
                     m_current_undo_group.push_back({
                         Modification::Erase, cur_line + line,
                         m_lines.get_storage(cur_line + line)});
 
-                it = m_lines.erase(it, it + d.len);
-                m_changes.push_back({ Change::Erase, cur_line, cur_line + d.len });
+                it = m_lines.erase(it, it + len);
+                m_changes.push_back({ Change::Erase, cur_line, cur_line + len });
             }
         }
     }
@@ -575,9 +575,9 @@ BufferCoord Buffer::advance(BufferCoord coord, ByteCount count) const
         count += coord.column;
         while (count < 0)
         {
-            count += m_lines[--line].length();
-            if (line < 0)
+            if (--line < 0)
                 return {0, 0};
+            count += m_lines[line].length();
         }
         return { line, count };
     }
@@ -604,7 +604,7 @@ BufferCoord Buffer::char_prev(BufferCoord coord) const
         return { coord.line - 1, m_lines[coord.line - 1].length() - 1 };
 
     auto line = m_lines[coord.line];
-    auto column = (int)(utf8::character_start(line.begin() + (int)coord.column - 1, line.begin()) - line.begin());
+    auto column = (int)(utf8::character_start(line.begin() + coord.column - 1, line.begin()) - line.begin());
     return { coord.line, column };
 }
 

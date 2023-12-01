@@ -23,7 +23,7 @@ declare-option -docstring \
 "Ordered list of windowing modules to try and load. An empty list disables
 both automatic module loading and environment detection, enabling complete
 manual control of the module loading." \
-str-list windowing_modules 'tmux' 'screen' 'kitty' 'iterm' 'sway' 'wayland' 'x11'
+str-list windowing_modules 'tmux' 'screen' 'zellij' 'kitty' 'iterm' 'sway' 'wayland' 'x11' 'wezterm'
 
 hook -group windowing global KakBegin .* %{
 
@@ -31,11 +31,11 @@ hook -group windowing global KakBegin .* %{
         set -- ${kak_opt_windowing_modules}
         if [ $# -gt 0 ]; then
             echo 'try %{ '
-            while [ $# -gt 1 ]; do
+            while [ $# -ge 1 ]; do
                 echo "require-module ${1} } catch %{ "
                 shift
             done
-            echo "require-module ${1} }"
+            echo "echo -debug 'no windowing module detected' }"
         fi
     }
 }

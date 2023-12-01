@@ -74,16 +74,14 @@ struct ParsedRegex
     };
 
     using NodeIndex = int16_t;
-    struct [[gnu::packed]] Node
+    struct Node
     {
         Op op;
         bool ignore_case;
         NodeIndex children_end;
         Codepoint value;
         Quantifier quantifier;
-        uint16_t filler = 0;
     };
-    static_assert(sizeof(Node) == 16, "");
 
     Vector<Node, MemoryDomain::Regex> nodes;
 
@@ -873,7 +871,7 @@ private:
         const auto res = m_program.instructions.size();
         if (res >= max_instructions)
             throw regex_error(format("regex compiled to more than {} instructions", max_instructions));
-        m_program.instructions.push_back({ op, false, 0, param });
+        m_program.instructions.push_back({ op, 0, param });
         return OpIndex(res);
     }
 
@@ -959,7 +957,7 @@ private:
                 {
                     for (Codepoint cp = 0; cp < CompiledRegex::StartDesc::count; ++cp)
                     {
-                        if (start_desc.map[cp] or is_character_class(character_class, cp))
+                        if (start_desc.map[cp] or character_class.matches(cp))
                             start_desc.map[cp] = true;
                     }
                 }
@@ -1078,7 +1076,7 @@ String dump_regex(const CompiledRegex& program)
     for (auto& inst : program.instructions)
     {
         char buf[20];
-        sprintf(buf, " %03d     ", count++);
+        format_to(buf, " {:03}     ", count++);
         res += buf;
         switch (inst.op)
         {
@@ -1146,7 +1144,7 @@ String dump_regex(const CompiledRegex& program)
             if (desc.map[c])
             {
                 if (c < 32)
-                    res += format("<0x{}>", Hex{c});
+                    res += format("<0x{}>", hex(c));
                 else
                     res += (char)c;
             }
@@ -1163,20 +1161,6 @@ String dump_regex(const CompiledRegex& program)
 CompiledRegex compile_regex(StringView re, RegexCompileFlags flags)
 {
     return RegexCompiler{RegexParser::parse(re), flags}.get_compiled_regex();
-}
-
-bool is_character_class(const CharacterClass& character_class, Codepoint cp)
-{
-    if (character_class.ignore_case)
-        cp = to_lower(cp);
-
-    auto it = std::find_if(character_class.ranges.begin(),
-                           character_class.ranges.end(),
-                           [cp](auto& range) { return range.min <= cp and cp <= range.max; });
-
-    bool found = it != character_class.ranges.end() or (character_class.ctypes != CharacterType::None and
-                                                        is_ctype(character_class.ctypes, cp));
-    return found != character_class.negative;
 }
 
 bool is_ctype(CharacterType ctype, Codepoint cp)
@@ -1204,6 +1188,8 @@ struct TestVM : CompiledRegex, ThreadedRegexVM<const char*, mode>
     {
         return TestVM::ThreadedRegexVM::exec(re.begin(), re.end(), re.begin(), re.end(), flags);
     }
+
+    using TestVM::ThreadedRegexVM::exec;
 };
 }
 
@@ -1565,9 +1551,20 @@ auto test_regex = UnitTest{[]{
     }
 
     {
+        TestVM<RegexMode::Forward | RegexMode::Search> vm{"ab"};
+        const char str[] = "fa😄ab";
+        kak_assert(not vm.exec(str, str+4, str, str + sizeof(str)-1, RegexExecFlags::None));
+    }
+
+    {
         TestVM<> vm{R"(\0\x0A\u00260e\u00260F)"};
         const char str[] = "\0\n☎☏"; // work around the null byte in the literal
         kak_assert(vm.exec({str, str + sizeof(str)-1}));
+    }
+
+    {
+        TestVM<RegexMode::Forward | RegexMode::Search> vm{".{40}"};
+        kak_assert(vm.exec("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", RegexExecFlags::None));
     }
 
     {

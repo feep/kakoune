@@ -10,6 +10,7 @@
 #include "buffer_utils.hh"
 #include "option.hh"
 #include "option_types.hh"
+#include "profile.hh"
 
 #include <algorithm>
 
@@ -84,45 +85,32 @@ static uint32_t compute_faces_hash(const FaceRegistry& faces)
 
 Window::Setup Window::build_setup(const Context& context) const
 {
-    Vector<BufferRange, MemoryDomain::Display> selections;
-    for (auto& sel : context.selections())
-        selections.push_back({sel.cursor(), sel.anchor()});
-
-    return { m_position, m_dimensions,
-             context.buffer().timestamp(),
-             compute_faces_hash(context.faces()),
-             context.selections().main_index(),
-             std::move(selections) };
+    return {m_position, m_dimensions,
+            context.buffer().timestamp(),
+            compute_faces_hash(context.faces()),
+            context.selections().main_index(),
+            context.selections() | gather<Vector<BasicSelection, MemoryDomain::Display>>()};
 }
 
 bool Window::needs_redraw(const Context& context) const
 {
     auto& selections = context.selections();
-
-    if (m_position != m_last_setup.position or
+    return m_position != m_last_setup.position or
         m_dimensions != m_last_setup.dimensions or
         context.buffer().timestamp() != m_last_setup.timestamp or
         selections.main_index() != m_last_setup.main_selection or
         selections.size() != m_last_setup.selections.size() or
-        compute_faces_hash(context.faces()) != m_last_setup.faces_hash)
-        return true;
-
-    for (int i = 0; i < selections.size(); ++i)
-    {
-        if (selections[i].cursor() != m_last_setup.selections[i].begin or
-            selections[i].anchor() != m_last_setup.selections[i].end)
-            return true;
-    }
-
-    return false;
+        compute_faces_hash(context.faces()) != m_last_setup.faces_hash or
+        not std::equal(selections.begin(), selections.end(),
+                       m_last_setup.selections.begin(), m_last_setup.selections.end());
 }
 
 const DisplayBuffer& Window::update_display_buffer(const Context& context)
 {
-    const bool profile = context.options()["debug"].get<DebugFlags>() &
-                        DebugFlags::Profile;
-
-    auto start_time = profile ? Clock::now() : Clock::time_point{};
+    ProfileScope profile{context, [&](std::chrono::microseconds duration) {
+        write_to_debug_buffer(format("window display update for '{}' took {} us",
+                                     buffer().display_name(), (size_t)duration.count()));
+    }, not (buffer().flags() & Buffer::Flags::Debug)};
 
     if (m_display_buffer.timestamp() != -1)
     {
@@ -155,24 +143,19 @@ const DisplayBuffer& Window::update_display_buffer(const Context& context)
 
     m_display_buffer.compute_range();
     const BufferRange range{{0,0}, buffer().end_coord()};
-    for (auto pass : { HighlightPass::Wrap, HighlightPass::Move, HighlightPass::Colorize })
-        m_builtin_highlighters.highlight({context, setup, pass, {}}, m_display_buffer, range);
+    m_builtin_highlighters.highlight({context, setup, HighlightPass::Wrap, {}}, m_display_buffer, range);
+    m_builtin_highlighters.highlight({context, setup, HighlightPass::Move, {}}, m_display_buffer, range);
 
     for (auto& line : m_display_buffer.lines())
         line.trim_from(setup.widget_columns, setup.first_column, m_dimensions.column);
+
+    m_builtin_highlighters.highlight({context, setup, HighlightPass::Colorize, {}}, m_display_buffer, range);
 
     m_display_buffer.optimize();
 
     set_position({setup.first_line, setup.first_column});
     m_last_setup = build_setup(context);
-
-    if (profile and not (buffer().flags() & Buffer::Flags::Debug))
-    {
-        using namespace std::chrono;
-        auto duration = duration_cast<microseconds>(Clock::now() - start_time);
-        write_to_debug_buffer(format("window display update for '{}' took {} us",
-                                     buffer().display_name(), (size_t)duration.count()));
-    }
+    m_last_display_setup = setup;
 
     return m_display_buffer;
 }
@@ -220,11 +203,15 @@ DisplaySetup Window::compute_display_setup(const Context& context) const
     const int tabstop = context.options()["tabstop"].get<int>();
     const auto& cursor = context.selections().main().cursor();
 
-    // Ensure cursor line is visible
-    if (cursor.line - offset.line < win_pos.line)
-        win_pos.line = std::max(0_line, cursor.line - offset.line);
-    if (cursor.line + offset.line >= win_pos.line + m_dimensions.line)
-        win_pos.line = std::min(buffer().line_count()-1, cursor.line + offset.line - m_dimensions.line + 1);
+    bool ensure_cursor_visible = context.ensure_cursor_visible;
+    if (ensure_cursor_visible)
+    {
+        if (cursor.line - offset.line < win_pos.line)
+            win_pos.line = std::max(0_line, cursor.line - offset.line);
+        if (cursor.line + offset.line >= win_pos.line + m_dimensions.line)
+            win_pos.line = cursor.line + offset.line - m_dimensions.line + 1;
+    }
+    win_pos.line = std::min(win_pos.line, buffer().line_count()-1);
 
     DisplaySetup setup{
         win_pos.line,
@@ -233,13 +220,15 @@ DisplaySetup Window::compute_display_setup(const Context& context) const
         0_col,
         {cursor.line - win_pos.line,
          get_column(buffer(), tabstop, cursor) - win_pos.column},
-        offset
+        offset,
+        ensure_cursor_visible
     };
     for (auto pass : { HighlightPass::Move, HighlightPass::Wrap })
         m_builtin_highlighters.compute_display_setup({context, setup, pass, {}}, setup);
     check_display_setup(setup, *this);
 
     // now ensure the cursor column is visible
+    if (ensure_cursor_visible)
     {
         auto underflow = std::max(-setup.first_column,
                                   setup.cursor_pos.column - setup.scroll_offset.column);
@@ -342,8 +331,6 @@ void Window::clear_display_buffer()
 void Window::on_option_changed(const Option& option)
 {
     run_hook_in_own_context(Hook::WinSetOption, format("{}={}", option.name(), option.get_desc_string()));
-    // a highlighter might depend on the option, so we need to redraw
-    force_redraw();
 }
 
 

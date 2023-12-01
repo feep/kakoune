@@ -43,17 +43,18 @@ public:
     Buffer& buffer() const { return *m_buffer; }
 
     bool needs_redraw(const Context& context) const;
-    void force_redraw() { m_last_setup = Setup{}; }
 
     void set_client(Client* client) { m_client = client; }
 
     void clear_display_buffer();
     void run_resize_hook_ifn();
 
-    DisplaySetup compute_display_setup(const Context& context) const;
+    const DisplaySetup& last_display_setup() const { return m_last_display_setup; }
+
 private:
     Window(const Window&) = delete;
 
+    DisplaySetup compute_display_setup(const Context& context) const;
     void on_option_changed(const Option& option) override;
 
     friend class ClientManager;
@@ -69,6 +70,7 @@ private:
 
     Highlighters m_builtin_highlighters;
     bool m_resize_hook_pending = false;
+    DisplaySetup m_last_display_setup;
 
     struct Setup
     {
@@ -77,7 +79,7 @@ private:
         size_t timestamp;
         size_t faces_hash;
         size_t main_selection;
-        Vector<BufferRange, MemoryDomain::Display> selections;
+        Vector<BasicSelection, MemoryDomain::Display> selections;
     };
     Setup build_setup(const Context& context) const;
     Setup m_last_setup;

@@ -44,6 +44,7 @@ constexpr auto enum_desc(Meta::Type<SelectMode>)
         { SelectMode::Append, "append" },
     });
 }
+
 void merge_selections(Selection& sel, const Selection& new_sel)
 {
     const bool forward = sel.cursor() >= sel.anchor();
@@ -190,23 +191,29 @@ String build_autoinfo_for_mapping(const Context& context, KeymapMode mode,
     }
 
     for (auto& key : keymaps.get_mapped_keys(mode))
-        descs.emplace_back(to_string(key),
-                           keymaps.get_mapping(key, mode).docstring);
+    {
+        const String& docstring = keymaps.get_mapping_docstring(key, mode);
+        if (auto it = find_if(descs, [&](auto& elem) { return elem.second == docstring; });
+            it != descs.end())
+            it->first += ',' + to_string(key);
+        else
+            descs.emplace_back(to_string(key), docstring);
+    }
 
     auto max_len = 0_col;
-    for (auto& desc : descs)
+    for (auto& [keys, docstring] : descs)
     {
-        auto len = desc.first.column_length();
+        auto len = keys.column_length();
         if (len > max_len)
             max_len = len;
     }
 
     String res;
-    for (auto& desc : descs)
+    for (auto& [keys, docstring] : descs)
         res += format("{}:{}{}\n",
-                      desc.first,
-                      String{' ', max_len - desc.first.column_length() + 1},
-                      desc.second);
+                      keys,
+                      String{' ', max_len - keys.column_length() + 1},
+                      docstring);
     return res;
 }
 
@@ -361,6 +368,7 @@ void view_commands(Context& context, NormalParams params)
     const int count = params.count;
     on_next_key_with_autoinfo(context, "view", KeymapMode::View,
                              [count](Key key, Context& context) {
+        context.ensure_cursor_visible = false;
         if (key == Key::Escape)
             return;
 
@@ -393,10 +401,10 @@ void view_commands(Context& context, NormalParams params)
             window.scroll(-std::max<ColumnCount>(1, count));
             break;
         case 'j':
-            scroll_window(context,  std::max<LineCount>(1, count));
+            scroll_window(context,  std::max<LineCount>(1, count), OnHiddenCursor::PreserveSelections);
             break;
         case 'k':
-            scroll_window(context, -std::max<LineCount>(1, count));
+            scroll_window(context, -std::max<LineCount>(1, count), OnHiddenCursor::PreserveSelections);
             break;
         case 'l':
             window.scroll( std::max<ColumnCount>(1, count));
@@ -463,17 +471,15 @@ void command(const Context& context, EnvVarMap env_vars, char reg = 0)
     if (not CommandManager::has_instance())
         throw runtime_error{"commands are not supported"};
 
-    CommandManager::instance().clear_last_complete_command();
-
     String default_command = context.main_sel_register_value(reg ? reg : ':').str();
 
     context.input_handler().prompt(
         ":", {}, default_command,
         context.faces()["Prompt"], PromptFlags::DropHistoryEntriesWithBlankPrefix,
         ':',
-        [](const Context& context, CompletionFlags flags,
-           StringView cmd_line, ByteCount pos) {
-               return CommandManager::instance().complete(context, flags, cmd_line, pos);
+        [completer=CommandManager::Completer{}](const Context& context, CompletionFlags flags,
+           StringView cmd_line, ByteCount pos) mutable {
+               return completer(context, flags, cmd_line, pos);
         },
         [env_vars = std::move(env_vars), default_command](StringView cmdline, PromptEvent event, Context& context) {
             if (context.has_client())
@@ -657,18 +663,13 @@ void change(Context& context, NormalParams params)
     enter_insert_mode<InsertMode::Replace>(context, params);
 }
 
-enum class PasteMode
-{
-    Append,
-    Insert,
-    Replace
-};
-
 BufferCoord paste_pos(Buffer& buffer, BufferCoord min, BufferCoord max, PasteMode mode, bool linewise)
 {
     switch (mode)
     {
         case PasteMode::Append:
+            if (buffer.is_end(max))
+                return max;
             return linewise ? std::min(buffer.line_count(), max.line+1) : buffer.char_next(max);
         case PasteMode::Insert:
             return linewise ? min.line : min;
@@ -833,7 +834,8 @@ void regex_prompt(Context& context, String prompt, char reg, T func)
                        [&](auto&& m) { candidates.push_back(m.candidate().str()); return true; });
             return {(int)(word.begin() - regex.begin()), pos,  std::move(candidates) };
         },
-        [=, func=T(std::move(func)), selection_edition=std::make_shared<ScopedSelectionEdition>(context)]
+        [=, func=T(std::move(func)), saved_reg=RegisterManager::instance()[reg].save(context),
+         selection_edition=std::make_shared<ScopedSelectionEdition>(context)]
         (StringView str, PromptEvent event, Context& context) mutable {
             try
             {
@@ -849,16 +851,24 @@ void regex_prompt(Context& context, String prompt, char reg, T func)
                         context.window().set_position(position);
 
                     context.input_handler().set_prompt_face(context.faces()["Prompt"]);
+                    RegisterManager::instance()[reg].restore(context, saved_reg);
                 }
 
-                if (not incsearch and event == PromptEvent::Change)
-                    return;
-
-                if (event == PromptEvent::Validate)
+                switch (event)
+                {
+                case PromptEvent::Abort: return;
+                case PromptEvent::Change:
+                    if (not incsearch)
+                        return;
+                    if (not str.empty())
+                        RegisterManager::instance()[reg].set(context, str.str());
+                    break;
+                case PromptEvent::Validate:
+                    RegisterManager::instance()[reg].set(context, str.str());
                     context.push_jump();
-
-                if (not str.empty() or event == PromptEvent::Validate)
-                    func(Regex{str.empty() ? default_regex : str, direction_flags(mode)}, event, context);
+                    break;
+                }
+                func(Regex{str.empty() ? default_regex : str, direction_flags(mode)}, event, context);
             }
             catch (regex_error& err)
             {
@@ -929,13 +939,8 @@ void search(Context& context, NormalParams params)
     const int count = params.count;
 
     regex_prompt<regex_mode>(context, prompt.str(), reg,
-                 [reg, count, saved_reg = RegisterManager::instance()[reg].save(context)]
+                 [count]
                  (const Regex& regex, PromptEvent event, Context& context) {
-                     RegisterManager::instance()[reg].restore(context, saved_reg);
-                     if (event == PromptEvent::Abort)
-                         return;
-                     RegisterManager::instance()[reg].set(context, regex.str());
-
                      if (regex.empty() or regex.str().empty())
                          return;
 
@@ -993,7 +998,7 @@ void use_selection_as_search_pattern(Context& context, NormalParams params)
                       smart and is_bow(buffer, beg) ? "\\b" : "",
                       escape(buffer.string(beg, end), "^$\\.*+?()[]{}|", '\\'),
                       smart and is_eow(buffer, end) ? "\\b" : "");
-    }) | gather<HashSet>();
+    }) | gather<HashSet<String>>();
     String pattern = join(patterns, '|', false);
 
     const char reg = to_lower(params.reg ? params.reg : '/');
@@ -1005,8 +1010,8 @@ void use_selection_as_search_pattern(Context& context, NormalParams params)
     RegisterManager::instance()[reg].set(context, {pattern});
 
     // Hack, as Window do not take register state into account
-    if (context.has_window())
-        context.window().force_redraw();
+    if (context.has_client())
+        context.client().force_redraw();
 }
 
 void select_regex(Context& context, NormalParams params)
@@ -1016,14 +1021,8 @@ void select_regex(Context& context, NormalParams params)
     auto prompt = capture ? format("select (capture {}):", capture) :  "select:"_str;
 
     regex_prompt(context, std::move(prompt), reg,
-                 [reg, capture, saved_reg = RegisterManager::instance()[reg].save(context)]
+                 [capture]
                  (Regex ex, PromptEvent event, Context& context) {
-        RegisterManager::instance()[reg].restore(context, saved_reg);
-        if (event == PromptEvent::Abort)
-            return;
-        if (not context.history_disabled())
-            RegisterManager::instance()[reg].set(context, ex.str());
-
         auto& selections = context.selections();
         auto& buffer = selections.buffer();
         if (not ex.empty() and not ex.str().empty())
@@ -1038,14 +1037,8 @@ void split_regex(Context& context, NormalParams params)
     auto prompt = capture ? format("split (on capture {}):", (int)capture) :  "split:"_str;
 
     regex_prompt(context, std::move(prompt), reg,
-                 [reg, capture, saved_reg = RegisterManager::instance()[reg].save(context)]
+                 [capture]
                  (Regex ex, PromptEvent event, Context& context) {
-        RegisterManager::instance()[reg].restore(context, saved_reg);
-        if (event == PromptEvent::Abort)
-            return;
-        if (not context.history_disabled())
-            RegisterManager::instance()[reg].set(context, ex.str());
-
         auto& selections = context.selections();
         auto& buffer = selections.buffer();
         if (not ex.empty() and not ex.str().empty())
@@ -1141,15 +1134,8 @@ void keep(Context& context, NormalParams params)
     const char reg = to_lower(params.reg ? params.reg : '/');
 
     regex_prompt(context, prompt.str(), reg,
-                 [reg, saved_reg = RegisterManager::instance()[reg].save(context),
-                  selection_edition=std::make_shared<ScopedSelectionEdition>(context)]
+                 [selection_edition=std::make_shared<ScopedSelectionEdition>(context)]
                  (const Regex& regex, PromptEvent event, Context& context) {
-        RegisterManager::instance()[reg].restore(context, saved_reg);
-        if (event == PromptEvent::Abort)
-            return;
-        if (not context.history_disabled())
-            RegisterManager::instance()[reg].set(context, regex.str());
-
         if (regex.empty() or regex.str().empty())
             return;
 
@@ -1164,7 +1150,7 @@ void keep(Context& context, NormalParams params)
             const auto flags = match_flags(is_bol(begin.coord()), false,
                                            is_bow(buffer, begin.coord()),
                                            is_eow(buffer, end.coord()));
-            if (regex_search(begin, end, begin, end, regex, flags) == matching)
+            if (regex_search(begin, end, begin, end, regex, flags, EventManager::handle_urgent_events) == matching)
                 keep.push_back(sel);
         }
         if (keep.empty())
@@ -1417,8 +1403,6 @@ void select_object(Context& context, NormalParams params)
          {{alt(';')},    "run command in object context"}}));
 }
 
-enum Direction { Backward = -1, Forward = 1 };
-
 template<Direction direction, bool half = false>
 void scroll(Context& context, NormalParams params)
 {
@@ -1426,7 +1410,7 @@ void scroll(Context& context, NormalParams params)
     const int count = params.count ? params.count : 1;
     const LineCount offset = (window.dimensions().line - 2) / (half ? 2 : 1) * count;
 
-    scroll_window(context, offset * direction);
+    scroll_window(context, offset * direction, OnHiddenCursor::MoveCursorAndAnchor);
 }
 
 template<Direction direction>
@@ -1775,6 +1759,7 @@ void spaces_to_tabs(Context& context, NormalParams params)
 
 void trim_selections(Context& context, NormalParams)
 {
+    using Utf8It = utf8::iterator<BufferIterator>;
     auto& buffer = context.buffer();
     ScopedSelectionEdition selection_edition{context};
     auto& selections = context.selections();
@@ -1783,8 +1768,8 @@ void trim_selections(Context& context, NormalParams)
     for (int i = 0; i < (int)selections.size(); ++i)
     {
         auto& sel = selections[i];
-        auto beg = buffer.iterator_at(sel.min());
-        auto end = buffer.iterator_at(sel.max());
+        auto beg = Utf8It{buffer.iterator_at(sel.min()), buffer};
+        auto end = Utf8It{buffer.iterator_at(sel.max()), buffer};
         while (beg != end and is_blank(*beg))
             ++beg;
         while (beg != end and is_blank(*end))
@@ -1794,8 +1779,8 @@ void trim_selections(Context& context, NormalParams)
             to_remove.push_back(i);
         else
         {
-            sel.min() = beg.coord();
-            sel.max() = end.coord();
+            sel.min() = beg.base().coord();
+            sel.max() = end.base().coord();
         }
     }
 
@@ -2039,18 +2024,12 @@ void move_in_history(Context& context, NormalParams params)
                             history_id, max_history_id));
 }
 
+template<Direction direction>
 void undo_selection_change(Context& context, NormalParams params)
 {
     int count = std::max(1, params.count);
     while (count--)
-        context.undo_selection_change();
-}
-
-void redo_selection_change(Context& context, NormalParams params)
-{
-    int count = std::max(1, params.count);
-    while (count--)
-        context.redo_selection_change();
+        context.undo_selection_change<direction>();
 }
 
 void exec_user_mappings(Context& context, NormalParams params)
@@ -2060,15 +2039,14 @@ void exec_user_mappings(Context& context, NormalParams params)
         if (not context.keymaps().is_mapped(key, KeymapMode::User))
             return;
 
-        auto& mapping = context.keymaps().get_mapping(key, KeymapMode::User);
         ScopedSetBool disable_keymaps(context.keymaps_disabled());
-        ScopedSetBool disable_history(context.history_disabled());
+        ScopedSetBool noninteractive(context.noninteractive());
 
         InputHandler::ScopedForceNormal force_normal{context.input_handler(), params};
 
         ScopedEdition edition(context);
         ScopedSelectionEdition selection_edition{context};
-        for (auto& key : mapping.keys)
+        for (auto& key : context.keymaps().get_mapping_keys(key, KeymapMode::User))
             context.input_handler().handle_key(key);
     }, "user mapping",
     build_autoinfo_for_mapping(context, KeymapMode::User, {}));
@@ -2215,16 +2193,24 @@ void duplicate_selections(Context& context, NormalParams params)
     SelectionList& sels = context.selections();
     Vector<Selection> new_sels;
     const int count = params.count ? params.count : 2;
+    BasicSelection last{BufferCoord{-1,-1}};
+    size_t index = 0;
+    size_t main_index = 0;
     for (const auto& sel : sels)
-        new_sels.insert(new_sels.end(), count, sel);
-    context.selections().set(std::move(new_sels), sels.main_index() * count);
+    {
+        new_sels.insert(new_sels.end(), sel != last ? count : 1, sel);
+        last = sel;
+        if (index++ == sels.main_index())
+            main_index = new_sels.size() - 1;
+    }
+    context.selections().set(std::move(new_sels), main_index);
 }
 
 void force_redraw(Context& context, NormalParams)
 {
     if (context.has_client())
     {
-        context.client().force_redraw();
+        context.client().force_redraw(true);
         context.client().redraw_ifn();
     }
 }
@@ -2375,11 +2361,11 @@ static constexpr HashMap<Key, NormalCmd, MemoryDomain::Undefined, KeymapBackend>
 
     { {'u'}, {"undo", undo} },
     { {'U'}, {"redo", redo} },
-    { {alt('u')}, {"move backward in history", move_in_history<Direction::Backward>} },
-    { {alt('U')}, {"move forward in history", move_in_history<Direction::Forward>} },
+    { {ctrl('k')}, {"move backward in history", move_in_history<Direction::Backward>} },
+    { {ctrl('j')}, {"move forward in history", move_in_history<Direction::Forward>} },
 
-    { {ctrl('h')}, {"undo selection change", undo_selection_change} },
-    { {ctrl('k')}, {"redo selection change", redo_selection_change} },
+    { {alt('u')}, {"undo selection change", undo_selection_change<Backward>} },
+    { {alt('U')}, {"redo selection change", undo_selection_change<Forward>} },
 
     { {alt('i')}, {"select inner object", select_object<ObjectFlags::ToBegin | ObjectFlags::ToEnd | ObjectFlags::Inner>} },
     { {alt('a')}, {"select whole object", select_object<ObjectFlags::ToBegin | ObjectFlags::ToEnd>} },

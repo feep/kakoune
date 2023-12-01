@@ -16,7 +16,7 @@ hook global BufSetOption filetype=asciidoc %{
     set-option buffer comment_block_end '////'
 }
 
-hook global BufSetOption filetype=(c|cpp|dart|gluon|go|java|javascript|objc|php|protobuf|rust|sass|scala|scss|swift|typescript) %{
+hook global BufSetOption filetype=(c|cpp|dart|gluon|go|java|javascript|objc|odin|php|protobuf|rust|sass|scala|scss|swift|typescript|groovy) %{
     set-option buffer comment_line '//'
     set-option buffer comment_block_begin '/*'
     set-option buffer comment_block_end '*/'
@@ -140,6 +140,12 @@ hook global BufSetOption filetype=ragel %{
 hook global BufSetOption filetype=ruby %{
     set-option buffer comment_block_begin '^begin='
     set-option buffer comment_block_end '^=end'
+}
+
+hook global BufSetOption filetype=sql %{
+    set-option buffer comment_line '--'
+    set-option buffer comment_block_begin '/*'
+    set-option buffer comment_block_end '*/'
 }
 
 define-command comment-block -docstring '(un)comment selections using block comments' %{

@@ -252,13 +252,14 @@ bool regular_file_exists(StringView filename)
            (st.st_mode & S_IFMT) == S_IFREG;
 }
 
+template<bool atomic>
 void write(int fd, StringView data)
 {
     const char* ptr = data.data();
     ssize_t count   = (int)data.length();
 
     int flags = fcntl(fd, F_GETFL, 0);
-    if (EventManager::has_instance())
+    if (not atomic and EventManager::has_instance())
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     auto restore_flags = on_scope_end([&] { fcntl(fd, F_SETFL, flags); });
 
@@ -269,12 +270,15 @@ void write(int fd, StringView data)
             ptr += written;
             count -= written;
         }
-        else if (errno == EAGAIN and EventManager::has_instance())
+        else if (errno == EAGAIN and not atomic and EventManager::has_instance())
             EventManager::instance().handle_next_events(EventMode::Urgent, nullptr, false);
         else
             throw file_access_error(format("fd: {}", fd), strerror(errno));
     }
 }
+template void write<true>(int fd, StringView data);
+template void write<false>(int fd, StringView data);
+
 
 void write_to_file(StringView filename, StringView data)
 {
@@ -295,7 +299,7 @@ void write_buffer_to_fd(Buffer& buffer, int fd)
         eoldata = "\n";
 
 
-    BufferedWriter writer{fd};
+    BufferedWriter<false> writer{fd};
     if (buffer.options()["BOM"].get<ByteOrderMark>() == ByteOrderMark::Utf8)
         writer.write("\xEF\xBB\xBF");
 
@@ -345,11 +349,11 @@ void write_buffer_to_file(Buffer& buffer, StringView filename,
     }
 
     if (force and ::chmod(zfilename, st.st_mode | S_IWUSR) < 0)
-        throw runtime_error("unable to change file permissions");
+        throw runtime_error(format("unable to change file permissions: {}", strerror(errno)));
 
     auto restore_mode = on_scope_end([&]{
         if ((force or replace) and ::chmod(zfilename, st.st_mode) < 0)
-            throw runtime_error("unable to restore file permissions");
+            throw runtime_error(format("unable to restore file permissions: {}", strerror(errno)));
     });
 
     char temp_filename[PATH_MAX];
@@ -517,6 +521,14 @@ CandidateList complete_filename(StringView prefix, const Regex& ignored_regex,
     {
         if (RankedMatch match{file, fileprefix})
             matches.push_back(match);
+    }
+    // Hack: when completing directories, also echo back the query if it
+    // is a valid directory. This enables menu completion to select the
+    // directory instead of a child.
+    if (only_dirs and not dirname.empty() and dirname.back() == '/' and fileprefix.empty()
+        and /* exists on disk */ not files.empty())
+    {
+        matches.push_back(RankedMatch{fileprefix, fileprefix});
     }
     std::sort(matches.begin(), matches.end());
     const bool expand = (flags & FilenameFlags::Expand);

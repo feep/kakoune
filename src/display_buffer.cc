@@ -55,24 +55,56 @@ ColumnCount DisplayAtom::length() const
     return 0;
 }
 
-void DisplayAtom::trim_begin(ColumnCount count)
+bool DisplayAtom::empty() const
 {
     if (m_type == Range)
-        m_range.begin = utf8::advance(get_iterator(*m_buffer, m_range.begin),
-                                      get_iterator(*m_buffer, m_range.end),
-                                      count).coord();
+        return m_range.begin == m_range.end;
     else
-        m_text = m_text.substr(count).str();
+        return m_text.empty();
 }
 
-void DisplayAtom::trim_end(ColumnCount count)
+ColumnCount DisplayAtom::trim_begin(ColumnCount count)
 {
+    ColumnCount res = 0;
     if (m_type == Range)
-        m_range.end = utf8::advance(get_iterator(*m_buffer, m_range.end),
-                                    get_iterator(*m_buffer, m_range.begin),
-                                    -count).coord();
+    {
+        auto it = get_iterator(*m_buffer, m_range.begin);
+        auto end = get_iterator(*m_buffer, m_range.end);
+        while (it != end and res < count)
+            res += codepoint_width(utf8::read_codepoint(it, end));
+        m_range.begin = std::min(it.coord(), m_range.end);
+    }
     else
-        m_text = m_text.substr(0, m_text.column_length() - count).str();
+    {
+        auto it = m_text.begin();
+        while (it != m_text.end() and res < count)
+            res += codepoint_width(utf8::read_codepoint(it, m_text.end()));
+        m_text = String{it, m_text.end()};
+    }
+
+    return res;
+}
+
+ColumnCount DisplayAtom::trim_end_to_length(ColumnCount count)
+{
+    ColumnCount res = 0;
+    if (m_type == Range)
+    {
+        auto it = get_iterator(*m_buffer, m_range.begin);
+        auto end = get_iterator(*m_buffer, m_range.end);
+        while (it != end and res < count)
+            res += codepoint_width(utf8::read_codepoint(it, end));
+        m_range.end = std::min(it.coord(), m_range.end);
+    }
+    else
+    {
+        auto it = m_text.begin();
+        while (it != m_text.end() and res < count)
+            res += codepoint_width(utf8::read_codepoint(it, m_text.end()));
+        m_text = String{m_text.begin(), it};
+    }
+
+    return res;
 }
 
 DisplayLine::DisplayLine(AtomList atoms)
@@ -133,9 +165,7 @@ DisplayLine::iterator DisplayLine::insert(iterator it, DisplayAtom atom)
         m_range.begin  = std::min(m_range.begin, atom.begin());
         m_range.end = std::max(m_range.end, atom.end());
     }
-    auto res = m_atoms.insert(it, std::move(atom));
-    compute_range();
-    return res;
+    return m_atoms.insert(it, std::move(atom));
 }
 
 DisplayAtom& DisplayLine::push_back(DisplayAtom atom)
@@ -147,6 +177,19 @@ DisplayAtom& DisplayLine::push_back(DisplayAtom atom)
     }
     m_atoms.push_back(std::move(atom));
     return m_atoms.back();
+}
+
+DisplayLine DisplayLine::extract(iterator beg, iterator end)
+{
+    if (beg == this->begin() and end == this->end())
+        return DisplayLine{std::move(*this)};
+
+    DisplayLine extracted{AtomList(std::move_iterator(beg), std::move_iterator(end))};
+    m_atoms.erase(beg, end);
+    if (extracted.m_range.begin == m_range.begin or
+        extracted.m_range.end == m_range.end)
+        compute_range();
+    return extracted;
 }
 
 DisplayLine::iterator DisplayLine::erase(iterator beg, iterator end)
@@ -220,28 +263,28 @@ bool DisplayLine::trim_from(ColumnCount first_col, ColumnCount front, ColumnCoun
         }
     }
 
+    auto front_it = it;
+    Optional<DisplayAtom> padding;
     while (front > 0 and it != end())
     {
-        auto len = it->length();
-        if (len <= front)
-        {
-            m_atoms.erase(it);
-            front -= len;
-        }
-        else
-        {
-            it->trim_begin(front);
-            front = 0;
-        }
+        front -= it->trim_begin(front);
+        kak_assert(it->empty() or front <= 0);
+        if (front < 0)
+            padding.emplace(it->has_buffer_range()
+                ? DisplayAtom{it->buffer(), {it->begin(), it->begin()}, String{' ', -front}, it->face}
+                : DisplayAtom{String{' ', -front}, it->face});
+
+        if (it->empty())
+            ++it;
     }
+    it = m_atoms.erase(front_it, it);
+    if (padding)
+        it = m_atoms.insert(it, std::move(*padding));
 
     it = begin();
     for (; it != end() and col_count > 0; ++it)
-        col_count -= it->length();
-
-    bool did_trim = it != end() || col_count < 0;
-    if (col_count < 0)
-        (it-1)->trim_end(-col_count);
+        col_count -= it->trim_end_to_length(col_count);
+    bool did_trim = it != end() && col_count == 0;
     m_atoms.erase(it, end());
 
     compute_range();
@@ -253,15 +296,16 @@ const BufferRange init_range{ {INT_MAX, INT_MAX}, {INT_MIN, INT_MIN} };
 void DisplayLine::compute_range()
 {
     m_range = init_range;
-    for (auto& atom : m_atoms)
-    {
-        if (not atom.has_buffer_range())
-            continue;
-        m_range.begin  = std::min(m_range.begin, atom.begin());
-        m_range.end = std::max(m_range.end, atom.end());
-    }
-    if (m_range == init_range)
+    auto first = find_if(m_atoms, std::mem_fn(&DisplayAtom::has_buffer_range));
+    if (first == m_atoms.end())
         m_range = { { 0, 0 }, { 0, 0 } };
+    else
+    {
+        auto last = std::find_if(m_atoms.rbegin(), std::reverse_iterator(first+1), std::mem_fn(&DisplayAtom::has_buffer_range));
+        m_range.begin = first->begin();
+        m_range.end = last->end();
+    }
+
     kak_assert(m_range.begin <= m_range.end);
 }
 

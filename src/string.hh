@@ -36,10 +36,10 @@ public:
     const_iterator begin() const { return type().data(); }
 
     [[gnu::always_inline]]
-    iterator end() { return type().data() + (int)type().length(); }
+    iterator end() { return type().data() + type().length(); }
 
     [[gnu::always_inline]]
-    const_iterator end() const { return type().data() + (int)type().length(); }
+    const_iterator end() const { return type().data() + type().length(); }
 
     reverse_iterator rbegin() { return reverse_iterator{end()}; }
     const_reverse_iterator rbegin() const { return const_reverse_iterator{end()}; }
@@ -77,14 +77,14 @@ public:
     { return utf8::advance(begin(), end(), count) - begin(); }
 
     CharCount char_count_to(ByteCount count) const
-    { return utf8::distance(begin(), begin() + (int)count); }
+    { return utf8::distance(begin(), begin() + count); }
 
     ColumnCount column_count_to(ByteCount count) const
-    { return utf8::column_distance(begin(), begin() + (int)count); }
+    { return utf8::column_distance(begin(), begin() + count); }
 
-    StringView substr(ByteCount from, ByteCount length = INT_MAX) const;
-    StringView substr(CharCount from, CharCount length = INT_MAX) const;
-    StringView substr(ColumnCount from, ColumnCount length = INT_MAX) const;
+    StringView substr(ByteCount from, ByteCount length = -1) const;
+    StringView substr(CharCount from, CharCount length = -1) const;
+    StringView substr(ColumnCount from, ColumnCount length = -1) const;
 
 private:
     [[gnu::always_inline]]
@@ -284,29 +284,23 @@ inline String String::no_copy(StringView str) { return {NoCopy{}, str}; }
 template<typename Type, typename CharType>
 inline StringView StringOps<Type, CharType>::substr(ByteCount from, ByteCount length) const
 {
-    if (length < 0)
-        length = INT_MAX;
     const auto str_len = type().length();
     kak_assert(from >= 0 and from <= str_len);
-    return StringView{ type().data() + (int)from, std::min(str_len - from, length) };
+    return StringView{type().data() + (int)from, std::min(str_len - from, length >= 0 ? length : str_len)};
 }
 
 template<typename Type, typename CharType>
 inline StringView StringOps<Type, CharType>::substr(CharCount from, CharCount length) const
 {
-    if (length < 0)
-        length = INT_MAX;
     auto beg = utf8::advance(begin(), end(), from);
-    return StringView{ beg, utf8::advance(beg, end(), length) };
+    return StringView{beg, length >= 0 ? utf8::advance(beg, end(), length) : end()};
 }
 
 template<typename Type, typename CharType>
 inline StringView StringOps<Type, CharType>::substr(ColumnCount from, ColumnCount length) const
 {
-    if (length < 0)
-        length = INT_MAX;
     auto beg = utf8::advance(begin(), end(), from);
-    return StringView{ beg, utf8::advance(beg, end(), length) };
+    return StringView{beg, (length >= 0) ? utf8::advance(beg, end(), length) : end()};
 }
 
 template<typename Type, typename CharType>
@@ -347,14 +341,17 @@ inline bool operator==(const StringView& lhs, const StringView& rhs)
        std::equal(lhs.begin(), lhs.end(), rhs.begin());
 }
 
-[[gnu::always_inline]]
-inline bool operator!=(const StringView& lhs, const StringView& rhs)
-{ return not (lhs == rhs); }
-
-inline bool operator<(const StringView& lhs, const StringView& rhs)
+inline auto operator<=>(const StringView& lhs, const StringView& rhs)
 {
-    return std::lexicographical_compare(lhs.begin(), lhs.end(),
-                                        rhs.begin(), rhs.end());
+    auto lit = lhs.begin(), lend = lhs.end(), rit = rhs.begin(), rend = rhs.end();
+    while (lit != lend and rit != rend) {
+         if (auto cmp = *lit++ <=> *rit++; cmp != 0)
+             return cmp;
+    }
+    if (lit == lend and rit == rend)
+        return std::strong_ordering::equal;
+    return lit == lend ? std::strong_ordering::less : std::strong_ordering::greater;
+
 }
 
 inline String operator"" _str(const char* str, size_t)

@@ -123,9 +123,9 @@ InsertCompletion complete_word(const SelectionList& sels,
     };
 
     auto& word_db = get_word_db(buffer);
-    Vector<RankedMatchAndBuffer> matches = word_db.find_matching(prefix)
-                                         | transform([&](auto& m) { return RankedMatchAndBuffer{m, &buffer}; })
-                                         | gather<Vector>();
+    auto matches = word_db.find_matching(prefix)
+                 | transform([&](auto& m) { return RankedMatchAndBuffer{m, &buffer}; })
+                 | gather<Vector<RankedMatchAndBuffer>>();
     // Remove words that are being edited
     for (auto& word_count : sel_word_counts)
     {
@@ -481,7 +481,7 @@ bool InsertCompleter::has_candidate_selected() const
 
 void InsertCompleter::try_accept()
 {
-    if (m_completions.is_valid() and m_context.has_client() and has_candidate_selected())
+    if (m_completions.is_valid() and has_candidate_selected())
         reset();
 }
 

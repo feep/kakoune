@@ -45,7 +45,7 @@ struct Token
     {
         Raw,
         RawQuoted,
-        RawEval,
+        Expand,
         ShellExpand,
         RegisterExpand,
         OptionExpand,
@@ -93,13 +93,6 @@ public:
                                 const ShellContext& shell_context);
 
 
-    Completions complete(const Context& context, CompletionFlags flags,
-                         StringView command_line, ByteCount cursor_pos);
-
-    Completions complete(const Context& context, CompletionFlags flags,
-                         CommandParameters params,
-                         size_t token_to_complete, ByteCount pos_in_token);
-
     Optional<CommandInfo> command_info(const Context& context,
                                        StringView command_line) const;
 
@@ -116,15 +109,34 @@ public:
 
     Completions complete_command_name(const Context& context, StringView query) const;
 
-    void clear_last_complete_command() { m_last_complete_command = String{}; }
-
     bool module_defined(StringView module_name) const;
 
     void register_module(String module_name, String commands);
 
     void load_module(StringView module_name, Context& context);
+    HashSet<String> loaded_modules() const;
 
     Completions complete_module_name(StringView query) const;
+
+    struct Completer
+    {
+        Completions operator()(const Context& context, CompletionFlags flags,
+                              StringView command_line, ByteCount cursor_pos);
+
+    private:
+        String m_last_complete_command;
+        CommandCompleter m_command_completer;
+    };
+
+    struct NestedCompleter
+    {
+        Completions operator()(const Context& context, CompletionFlags flags,
+                               CommandParameters params, size_t token_to_complete, ByteCount pos_in_token);
+
+    private:
+        String m_last_complete_command;
+        CommandCompleter m_command_completer;
+    };
 
 private:
     struct Command
@@ -138,7 +150,6 @@ private:
     };
     using CommandMap = HashMap<String, Command, MemoryDomain::Commands>;
     CommandMap m_commands;
-    String m_last_complete_command;
     int m_command_depth = 0;
 
     struct Module

@@ -3,6 +3,42 @@
 This changelog contains major and/or breaking changes to Kakoune between
 released versions.
 
+== Development version
+
+* `shell-script-candidates` completion now runs the script asynchronously
+  while displaying and updating results live.
+
+* `%val{window_range}` elements are now emitted as different strings
+
+* `+` only duplicates identical selections a single time to avoid surprising
+  and slow exponential growth in the number of selections.
+
+* `daemonize-session` command makes it possible to convert the current session
+  to a daemon one (which will not exit on last client disconnecting)
+
+* View mode commands and mouse scrolling no longer change selections when those go off-screen.
+
+* New commands `git apply`, `git edit`, `git grep`
+
+== Kakoune 2023.08.08
+
+* Fix compilation errors on FreeBSD and MacOS using clang
+
+== Kakoune 2023.07.29
+
+* `<a-u>` and `<a-U>` now undo/redo selection changes; the previous meaning
+  of moving in history tree has been moved to `<c-j>` and `<c-k>`
+
+* `%exp{...}` expansions provide flexible quoting for expanded strings
+  (as double quoted strings)
+
+* `<c-g>` cancels the current operation and goes back to the main event
+  loop, this provides an escape hatch when Kakoune seems to hang due to
+  a costly operation
+
+* `show-matching -previous` highlighter will fall back onto the character
+  preceeding the cursor
+
 == Kakoune 2022.10.31
 
 * `complete-command` (See <<commands#configuring-command-completion,`:doc commands configuring-command-completion`>>)
