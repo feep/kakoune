@@ -53,12 +53,14 @@ Client::Client(std::unique_ptr<UserInterface>&& ui,
             killpg(getpgrp(), SIGINT);
             set_signal_handler(SIGINT, prev_handler);
         }
-        else if (key == ctrl('g'))
-        {
-            m_pending_keys.clear();
-            print_status({"operation cancelled", context().faces()["Error"]});
-            throw cancel{};
-        }
+        // TODO this should be bound to something
+
+        // else if (key == ctrl('g'))
+        // {
+        //     m_pending_keys.clear();
+        //     print_status({"operation cancelled", context().faces()["Error"]});
+        //     throw cancel{};
+        // }
         else if (key.modifiers & Key::Modifiers::Resize)
         {
             m_window->set_dimensions(key.coord());
