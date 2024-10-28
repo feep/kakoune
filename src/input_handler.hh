@@ -2,10 +2,13 @@
 #define input_handler_hh_INCLUDED
 
 #include "completion.hh"
-#include "constexpr_utils.hh"
+#include "array.hh"
 #include "context.hh"
+#include "env_vars.hh"
+#include "enum.hh"
 #include "face.hh"
 #include "normal.hh"
+#include "optional.hh"
 #include "keys.hh"
 #include "string.hh"
 #include "utils.hh"
@@ -15,14 +18,6 @@
 
 namespace Kakoune
 {
-
-enum class MenuEvent
-{
-    Select,
-    Abort,
-    Validate
-};
-using MenuCallback = std::function<void (int, MenuEvent, Context&)>;
 
 enum class PromptEvent
 {
@@ -47,8 +42,7 @@ class InputMode;
 enum class KeymapMode : char;
 enum class CursorMode;
 
-using PromptCompleter = std::function<Completions (const Context&, CompletionFlags,
-                                                   StringView, ByteCount)>;
+using PromptCompleter = std::function<Completions (const Context&, StringView, ByteCount)>;
 enum class InsertMode : unsigned
 {
     Insert,
@@ -58,6 +52,12 @@ enum class InsertMode : unsigned
     AppendAtLineEnd,
     OpenLineBelow,
     OpenLineAbove
+};
+
+struct ModeInfo
+{
+    DisplayLine display_line;
+    Optional<NormalParams> normal_params;
 };
 
 class InputHandler : public SafeCountable
@@ -85,19 +85,13 @@ public:
     void set_prompt_face(Face prompt_face);
     bool history_enabled() const;
 
-    // enter menu mode, callback is called on each selection change,
-    // abort or validation with corresponding MenuEvent value
-    // returns to normal mode after validation if callback does
-    // not change the mode itself
-    void menu(Vector<DisplayLine> choices, MenuCallback callback);
-
     // execute callback on next keypress and returns to normal mode
     // if callback does not change the mode itself
     void on_next_key(StringView mode_name, KeymapMode mode, KeyCallback callback,
                      Timer::Callback idle_callback = Timer::Callback{});
 
     // process the given key
-    void handle_key(Key key);
+    void handle_key(Key key, bool synthesized);
 
     void refresh_ifn();
 
@@ -111,7 +105,7 @@ public:
     Context& context() { return m_context; }
     const Context& context() const { return m_context; }
 
-    DisplayLine mode_line() const;
+    ModeInfo mode_info() const;
 
     std::pair<CursorMode, DisplayCoord> get_cursor_info() const;
 
@@ -137,6 +131,9 @@ private:
     void push_mode(InputMode* new_mode);
     void pop_mode(InputMode* current_mode);
 
+    void record_key(Key key);
+    void drop_last_recorded_key();
+
     struct Insertion{
         NestedBool recording;
         InsertMode mode;
@@ -145,11 +142,11 @@ private:
         int count;
     } m_last_insert = { {}, InsertMode::Insert, {}, false, 1 };
 
-    char   m_recording_reg = 0;
-    String m_recorded_keys;
-    int    m_recording_level = -1;
+    int m_handle_key_level = 0;
 
-    int    m_handle_key_level = 0;
+    char        m_recording_reg = 0;
+    Vector<Key> m_recorded_keys;
+    int         m_recording_level = -1;
 };
 
 enum class AutoInfo

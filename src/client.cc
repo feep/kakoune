@@ -1,16 +1,16 @@
 #include "client.hh"
 
-#include "face_registry.hh"
 #include "context.hh"
-#include "buffer_manager.hh"
 #include "buffer_utils.hh"
+#include "debug.hh"
 #include "file.hh"
 #include "remote.hh"
 #include "option.hh"
 #include "option_types.hh"
 #include "client_manager.hh"
-#include "command_manager.hh"
 #include "event_manager.hh"
+#include "shell_manager.hh"
+#include "command_manager.hh"
 #include "user_interface.hh"
 #include "window.hh"
 #include "hash_map.hh"
@@ -113,7 +113,7 @@ bool Client::process_pending_inputs()
             else
             {
                 context().ensure_cursor_visible = true;
-                m_input_handler.handle_key(key);
+                m_input_handler.handle_key(key, false);
             }
 
             context().hooks().run_hook(Hook::RawKey, to_string(key), context());
@@ -132,6 +132,7 @@ void Client::print_status(DisplayLine status_line)
 {
     m_status_line = std::move(status_line);
     m_ui_pending |= StatusLine;
+    m_pending_clear &= ~PendingClear::StatusLine;
 }
 
 
@@ -167,11 +168,16 @@ DisplayLine Client::generate_mode_line() const
     DisplayLine modeline;
     try
     {
+        auto [mode_info_line, normal_params] = context().client().input_handler().mode_info();
         const String& modelinefmt = context().options()["modelinefmt"].get<String>();
-        HashMap<String, DisplayLine> atoms{{ "mode_info", context().client().input_handler().mode_line() },
+        HashMap<String, DisplayLine> atoms{{ "mode_info",  mode_info_line},
                                            { "context_info", {generate_context_info(context()),
                                                               context().faces()["Information"]}}};
-        auto expanded = expand(modelinefmt, context(), ShellContext{},
+        ShellContext shell_context{{}, {
+            {"register", normal_params ? StringView{normal_params->reg}.str() : ""},
+            {"count", normal_params ? String{to_string(normal_params->count)} : ""},
+        }};
+        auto expanded = expand(modelinefmt, context(), shell_context,
                                [](String s) { return escape(s, '{', '\\'); });
         modeline = parse_display_line(expanded, context().faces(), atoms);
     }
@@ -252,7 +258,7 @@ void Client::redraw_ifn()
     if ((m_ui_pending & MenuShow) or update_menu_anchor)
     {
         auto anchor = m_menu.style == MenuStyle::Inline ?
-            window.display_position(m_menu.anchor) : DisplayCoord{};
+            window.display_coord(m_menu.anchor) : DisplayCoord{};
         if (not (m_ui_pending & MenuShow) and m_menu.ui_anchor != anchor)
             m_ui_pending |= anchor ? (MenuShow | MenuSelect) : MenuHide;
         m_menu.ui_anchor = anchor;
@@ -272,7 +278,7 @@ void Client::redraw_ifn()
     if ((m_ui_pending & InfoShow) or update_info_anchor)
     {
         auto anchor = is_inline(m_info.style) ?
-             window.display_position(m_info.anchor) : DisplayCoord{};
+             window.display_coord(m_info.anchor) : DisplayCoord{};
         if (not (m_ui_pending & MenuShow) and m_info.ui_anchor != anchor)
             m_ui_pending |= anchor ? InfoShow : InfoHide;
         m_info.ui_anchor = anchor;
@@ -396,7 +402,7 @@ void Client::check_if_buffer_needs_reloading()
             return;
 
         if (MappedFile fd{filename};
-            fd.st.st_size == status.file_size and hash_data(fd.data, fd.st.st_size) == status.hash)
+            fd.st.st_size == status.file_size and murmur3(fd.data, fd.st.st_size) == status.hash)
             return;
 
         if (reload == Autoreload::Ask)
@@ -464,6 +470,7 @@ void Client::info_show(DisplayLine title, DisplayLineList content, BufferCoord a
     m_info = Info{ std::move(title), std::move(content), anchor, {}, style };
     m_ui_pending |= InfoShow;
     m_ui_pending &= ~InfoHide;
+    m_pending_clear &= ~PendingClear::Info;
 }
 
 void Client::info_show(StringView title, StringView content, BufferCoord anchor, InfoStyle style)
@@ -485,6 +492,23 @@ void Client::info_hide(bool even_modal)
     m_info = Info{};
     m_ui_pending |= InfoHide;
     m_ui_pending &= ~InfoShow;
+}
+
+void Client::schedule_clear()
+{
+    if (not (m_ui_pending & InfoShow))
+        m_pending_clear |= PendingClear::Info;
+    if (not (m_ui_pending & StatusLine))
+        m_pending_clear |= PendingClear::StatusLine;
+}
+
+void Client::clear_pending()
+{
+    if (m_pending_clear & PendingClear::StatusLine)
+        print_status({});
+    if (m_pending_clear & PendingClear::Info)
+        info_hide();
+    m_pending_clear = PendingClear::None;
 }
 
 }

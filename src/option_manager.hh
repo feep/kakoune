@@ -5,9 +5,10 @@
 #include "exception.hh"
 #include "hash_map.hh"
 #include "option.hh"
+#include "option_types.hh"
 #include "ranges.hh"
-#include "utils.hh"
 #include "vector.hh"
+#include "format.hh"
 #include "string_utils.hh"
 
 #include <memory>
@@ -88,6 +89,8 @@ class OptionManager final : private OptionManagerWatcher
 public:
     OptionManager(OptionManager& parent);
     ~OptionManager();
+
+    void reparent(OptionManager& parent);
 
     Option& operator[] (StringView name);
     const Option& operator[] (StringView name) const;

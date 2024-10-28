@@ -58,14 +58,24 @@ public:
     friend constexpr bool with_bit_ops(Meta::Type<Flags>) { return true; }
 
     std::pair<String, int> eval(StringView cmdline, const Context& context,
-                                StringView input = {},
+                                FunctionRef<StringView ()> stdin_generator,
                                 Flags flags = Flags::WaitForStdout,
                                 const ShellContext& shell_context = {});
+
+    std::pair<String, int> eval(StringView cmdline, const Context& context,
+                                StringView in,
+                                Flags flags = Flags::WaitForStdout,
+                                const ShellContext& shell_context = {})
+    {
+        return eval(cmdline, context,
+                    [in]() mutable { return std::exchange(in, StringView{}); },
+                    flags, shell_context);
+    }
 
     Shell spawn(StringView cmdline,
                 const Context& context,
                 bool open_stdin,
-                const ShellContext& shell_complete = {});
+                const ShellContext& shell_context = {});
 
     Vector<String> get_val(StringView name, const Context& context) const;
 

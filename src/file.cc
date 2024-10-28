@@ -4,12 +4,10 @@
 #include "buffer.hh"
 #include "exception.hh"
 #include "flags.hh"
-#include "option_types.hh"
 #include "event_manager.hh"
 #include "ranked_match.hh"
 #include "regex.hh"
 #include "string.hh"
-#include "unicode.hh"
 
 #include <limits>
 #include <cerrno>
@@ -351,16 +349,16 @@ void write_buffer_to_file(Buffer& buffer, StringView filename,
     if (force and ::chmod(zfilename, st.st_mode | S_IWUSR) < 0)
         throw runtime_error(format("unable to change file permissions: {}", strerror(errno)));
 
-    auto restore_mode = on_scope_end([&]{
-        if ((force or replace) and ::chmod(zfilename, st.st_mode) < 0)
-            throw runtime_error(format("unable to restore file permissions: {}", strerror(errno)));
-    });
-
     char temp_filename[PATH_MAX];
     const int fd = replace ? open_temp_file(filename, temp_filename)
                            : open(zfilename, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd == -1)
-        throw file_access_error(filename, strerror(errno));
+    {
+        auto saved_errno = errno;
+        if (force)
+            ::chmod(zfilename, st.st_mode);
+        throw file_access_error(filename, strerror(saved_errno));
+    }
 
     {
         auto close_fd = on_scope_end([fd]{ close(fd); });
@@ -369,8 +367,19 @@ void write_buffer_to_file(Buffer& buffer, StringView filename,
             ::fsync(fd);
     }
 
+    if (replace and geteuid() == 0 and ::chown(temp_filename, st.st_uid, st.st_gid) < 0)
+        throw runtime_error(format("unable to set replacement file ownership: {}", strerror(errno)));
+    if (replace and ::chmod(temp_filename, st.st_mode) < 0)
+        throw runtime_error(format("unable to set replacement file permissions: {}", strerror(errno)));
+    if (force and not replace and ::chmod(zfilename, st.st_mode) < 0)
+        throw runtime_error(format("unable to restore file permissions: {}", strerror(errno)));
+
     if (replace and rename(temp_filename, zfilename) != 0)
+    {
+        if (force)
+            ::chmod(zfilename, st.st_mode);
         throw runtime_error("replacing file failed");
+    }
 
     if ((buffer.flags() & Buffer::Flags::File) and
         real_path(filename) == real_path(buffer.name()))
@@ -553,7 +562,7 @@ CandidateList complete_command(StringView prefix, ByteCount cursor_pos)
         Vector<RankedMatch> matches;
         for (auto& file : files)
         {
-            if (RankedMatch match{file, real_prefix})
+            if (RankedMatch match{file, fileprefix})
                 matches.push_back(match);
         }
         std::sort(matches.begin(), matches.end());
@@ -615,7 +624,7 @@ FsStatus get_fs_status(StringView filename)
 {
     MappedFile fd{filename};
 
-    return {fd.st.st_mtim, fd.st.st_size, hash_data(fd.data, fd.st.st_size)};
+    return {fd.st.st_mtim, fd.st.st_size, murmur3(fd.data, fd.st.st_size)};
 }
 
 String get_kak_binary_path()
@@ -623,9 +632,10 @@ String get_kak_binary_path()
     char buffer[2048];
 #if defined(__linux__) or defined(__CYGWIN__) or defined(__gnu_hurd__)
     ssize_t res = readlink("/proc/self/exe", buffer, 2048);
-    kak_assert(res != -1);
-    buffer[res] = '\0';
-    return buffer;
+    if (res != -1 && res < 2048) {
+        buffer[res] = '\0';
+        return buffer;
+    }
 #elif defined(__FreeBSD__) or defined(__NetBSD__)
 #if defined(__FreeBSD__)
     int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
@@ -633,37 +643,44 @@ String get_kak_binary_path()
     int mib[] = {CTL_KERN, KERN_PROC_ARGS, -1, KERN_PROC_PATHNAME};
 #endif
     size_t res = sizeof(buffer);
-    sysctl(mib, 4, buffer, &res, NULL, 0);
-    return buffer;
+    if (sysctl(mib, 4, buffer, &res, NULL, 0) != -1)
+        return buffer;
 #elif defined(__APPLE__)
     uint32_t bufsize = 2048;
-    _NSGetExecutablePath(buffer, &bufsize);
-    char* canonical_path = realpath(buffer, nullptr);
-    String path = canonical_path;
-    free(canonical_path);
-    return path;
+    char* canonical_path = NULL;
+    if (_NSGetExecutablePath(buffer, &bufsize) != -1)
+        canonical_path = realpath(buffer, nullptr);
+    if (canonical_path) {
+        String path = canonical_path;
+        free(canonical_path);
+        return path;
+    }
 #elif defined(__HAIKU__)
     BApplication app("application/x-vnd.kakoune");
     app_info info;
-    status_t status = app.GetAppInfo(&info);
-    kak_assert(status == B_OK);
-    BPath path(&info.ref);
-    return path.Path();
+    if (app.GetAppInfo(&info) == B_OK) {
+        BPath path(&info.ref);
+        return path.Path();
+    }
 #elif defined(__DragonFly__)
     ssize_t res = readlink("/proc/curproc/file", buffer, 2048);
-    kak_assert(res != -1);
-    buffer[res] = '\0';
-    return buffer;
+    if (res != -1 && res < 2048) {
+        buffer[res] = '\0';
+        return buffer;
+    }
 #elif defined(__OpenBSD__)
+    (void)buffer;
     return KAK_BIN_PATH;
 #elif defined(__sun__)
     ssize_t res = readlink("/proc/self/path/a.out", buffer, 2048);
-    kak_assert(res != -1);
-    buffer[res] = '\0';
-    return buffer;
+    if (res != -1 && res < 2048) {
+        buffer[res] = '\0';
+        return buffer;
+    }
 #else
 # error "finding executable path is not implemented on this platform"
 #endif
+    throw runtime_error("unable to get the executable path");
 }
 
 }

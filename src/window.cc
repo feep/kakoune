@@ -1,13 +1,14 @@
 #include "window.hh"
 
 #include "assert.hh"
-#include "clock.hh"
+#include "buffer.hh"
+#include "buffer_utils.hh"
 #include "context.hh"
 #include "highlighter.hh"
 #include "hook_manager.hh"
 #include "input_handler.hh"
 #include "client.hh"
-#include "buffer_utils.hh"
+#include "debug.hh"
 #include "option.hh"
 #include "option_types.hh"
 #include "profile.hh"
@@ -148,6 +149,8 @@ const DisplayBuffer& Window::update_display_buffer(const Context& context)
 
     for (auto& line : m_display_buffer.lines())
         line.trim_from(setup.widget_columns, setup.first_column, m_dimensions.column);
+    if (m_display_buffer.lines().size() > m_dimensions.line)
+        m_display_buffer.lines().resize((size_t)m_dimensions.line);
 
     m_builtin_highlighters.highlight({context, setup, HighlightPass::Colorize, {}}, m_display_buffer, range);
 
@@ -293,7 +296,7 @@ BufferCoord find_buffer_coord(const DisplayLine& line, const Buffer& buffer,
 }
 }
 
-Optional<DisplayCoord> Window::display_position(BufferCoord coord) const
+Optional<DisplayCoord> Window::display_coord(BufferCoord coord) const
 {
     if (m_display_buffer.timestamp() != buffer().timestamp())
         return {};
@@ -309,13 +312,13 @@ Optional<DisplayCoord> Window::display_position(BufferCoord coord) const
     return {};
 }
 
-BufferCoord Window::buffer_coord(DisplayCoord coord) const
+Optional<BufferCoord> Window::buffer_coord(DisplayCoord coord) const
 {
     if (m_display_buffer.timestamp() != buffer().timestamp() or
         m_display_buffer.lines().empty())
-        return {0, 0};
+        return {};
     if (coord <= 0_line)
-        coord = {0,0};
+        coord = {};
     if ((size_t)coord.line >= m_display_buffer.lines().size())
         coord = DisplayCoord{(int)m_display_buffer.lines().size()-1, INT_MAX};
 

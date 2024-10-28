@@ -1,7 +1,9 @@
 #include "highlighter_group.hh"
 
+#include "flags.hh"
+#include "format.hh"
 #include "ranges.hh"
-#include "string_utils.hh"
+
 
 namespace Kakoune
 {
@@ -43,7 +45,10 @@ void HighlighterGroup::add_child(String name, std::unique_ptr<Highlighter>&& hl,
 
 void HighlighterGroup::remove_child(StringView id)
 {
-    m_highlighters.remove(id);
+    auto it = m_highlighters.find(id);
+    if (it == m_highlighters.end())
+        throw child_not_found(format("no such id: '{}'", id));
+    m_highlighters.remove(it);
 }
 
 Highlighter& HighlighterGroup::get_child(StringView path)

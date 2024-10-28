@@ -23,9 +23,6 @@ The *map* command makes *key* behave as if the *keys* sequence was typed.
     *prompt*::
         prompts, such as when entering a command through *:*, or a regex through */*
 
-    *menu*::
-        mode entered when a menu is displayed with the 'menu' command
-
     *user*::
         mode entered when the user prefix is hit (default: '<space>')
 
@@ -136,9 +133,9 @@ be used:
 *<F1>*, *<F2>*, ...*<F12>*::
     Function keys.
 
-*<semicolon>*, *<percent>*::
-    The *;* and *%* characters, these keys allow reducing the amount of
-    backslash escaping in scripts (for example, `exec \%` becomes `exec
+*<semicolon>*, *<percent>*, *<quote>*, *<dquote>*::
+    The *;*, *%*, *'* and *"* characters, these keys allow reducing the amount
+    of backslash escaping in scripts (for example, `exec \%` becomes `exec
     <percent>`)
 
 NOTE: Although Kakoune allows many key combinations to be mapped, not every

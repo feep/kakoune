@@ -2,9 +2,7 @@
 
 #include "buffer.hh"
 #include "line_modification.hh"
-#include "option_types.hh"
 #include "unit_tests.hh"
-#include "utils.hh"
 #include "value.hh"
 
 namespace Kakoune
@@ -223,7 +221,7 @@ UnitTest test_word_db{[]()
                        });
     };
 
-    auto make_lines = [](auto&&... lines) { return BufferLines{StringData::create({lines})...}; };
+    auto make_lines = [](auto&&... lines) { return BufferLines{StringData::create(lines)...}; };
 
     Buffer buffer("test", Buffer::Flags::None,
                   make_lines("tchou mutch\n", "tchou kanaky tchou\n", "\n", "tchaa tchaa\n", "allo\n"));

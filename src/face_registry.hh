@@ -2,7 +2,6 @@
 #define face_registry_hh_INCLUDED
 
 #include "face.hh"
-#include "utils.hh"
 #include "hash_map.hh"
 #include "ranges.hh"
 #include "string.hh"
@@ -23,6 +22,8 @@ class FaceRegistry : public SafeCountable
 {
 public:
     FaceRegistry(FaceRegistry& parent) : SafeCountable{}, m_parent(&parent) {}
+
+    void reparent(FaceRegistry& parent) { m_parent = &parent; }
 
     Face operator[](StringView facedesc) const;
     Face operator[](const FaceSpec& facespec) const;

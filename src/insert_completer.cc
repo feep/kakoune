@@ -2,6 +2,7 @@
 
 #include "buffer_manager.hh"
 #include "buffer_utils.hh"
+#include "debug.hh"
 #include "client.hh"
 #include "command_manager.hh"
 #include "changes.hh"
@@ -16,7 +17,6 @@
 #include "utf8_iterator.hh"
 #include "user_interface.hh"
 
-#include <numeric>
 #include <utility>
 
 namespace Kakoune
@@ -164,7 +164,7 @@ InsertCompletion complete_word(const SelectionList& sels,
     constexpr size_t max_count = 100;
     // Gather best max_count matches
     InsertCompletion::CandidateList candidates;
-    candidates.reserve(std::min(matches.size(), max_count));
+    candidates.reserve(std::min(matches.size(), max_count) + 1);
 
     for_n_best(matches, max_count, [](auto& lhs, auto& rhs) { return rhs < lhs; },
                [&](RankedMatchAndBuffer& m) {
@@ -298,10 +298,11 @@ InsertCompletion complete_option(const SelectionList& sels,
     StringView query = buffer.substr(coord, cursor_pos);
     Vector<RankedMatchAndInfo> matches;
 
-    for (auto& candidate : opt.list)
+    for (auto&& [i, candidate] : opt.list | enumerate())
     {
         if (RankedMatchAndInfo match{std::get<0>(candidate), query})
         {
+            match.set_input_sequence_number(i);
             match.on_select = std::get<1>(candidate);
             auto& menu = std::get<2>(candidate);
             match.menu_entry = not menu.empty() ?
@@ -314,20 +315,19 @@ InsertCompletion complete_option(const SelectionList& sels,
 
     constexpr size_t max_count = 100;
     // Gather best max_count matches
-    auto greater = [](auto& lhs, auto& rhs) { return rhs < lhs; };
-    auto first = matches.begin(), last = matches.end();
-    std::make_heap(first, last, greater);
     InsertCompletion::CandidateList candidates;
-    candidates.reserve(std::min(matches.size(), max_count));
-    candidates.reserve(matches.size());
-    while (candidates.size() < max_count and first != last)
-    {
-        if (candidates.empty() or candidates.back().completion != first->candidate()
-            or candidates.back().on_select != first->on_select)
-            candidates.push_back({ first->candidate().str(), first->on_select.str(),
-                                   std::move(first->menu_entry) });
-        std::pop_heap(first, last--, greater);
-    }
+    candidates.reserve(std::min(matches.size(), max_count) + 1);
+
+    for_n_best(matches, max_count, [](auto& lhs, auto& rhs) { return rhs < lhs; },
+               [&](RankedMatchAndInfo& m) {
+        if (not candidates.empty()
+            and candidates.back().completion == m.candidate()
+            and candidates.back().on_select == m.on_select)
+            return false;
+        candidates.push_back({ m.candidate().str(), m.on_select.str(),
+                               std::move(m.menu_entry) });
+        return true;
+    });
 
     auto end = cursor_pos;
     if (match[3].matched)
@@ -403,7 +403,10 @@ InsertCompletion complete_line(const SelectionList& sels,
 }
 
 InsertCompleter::InsertCompleter(Context& context)
-    : m_context(context), m_options(context.options()), m_faces(context.faces())
+    : m_context(context),
+      // local scopes might go away before completion ends, make sure to register on a long lived one
+      m_options(context.scope(false).options()),
+      m_faces(context.scope(false).faces())
 {
     m_options.register_watcher(*this);
 }
@@ -413,7 +416,7 @@ InsertCompleter::~InsertCompleter()
     m_options.unregister_watcher(*this);
 }
 
-void InsertCompleter::select(int index, bool relative, Vector<Key>& keystrokes)
+void InsertCompleter::select(int index, bool relative, FunctionRef<void (Key)> record_key)
 {
     m_enabled = true;
     if (not setup_ifn())
@@ -450,12 +453,14 @@ void InsertCompleter::select(int index, bool relative, Vector<Key>& keystrokes)
         m_context.client().menu_select(m_current_candidate);
     }
 
-    for (auto i = 0_byte; i < prefix_len; ++i)
-        keystrokes.emplace_back(Key::Backspace);
-    for (auto i = 0_byte; i < suffix_len; ++i)
-        keystrokes.emplace_back(Key::Delete);
-    for (auto& c : candidate.completion)
-        keystrokes.emplace_back(c);
+    {
+        for (auto i = 0_byte; i < prefix_len; ++i)
+            record_key(Key::Backspace);
+        for (auto i = 0_byte; i < suffix_len; ++i)
+            record_key(Key::Delete);
+        for (auto& c : candidate.completion)
+            record_key(c);
+    }
 
     if (not candidate.on_select.empty())
         CommandManager::instance().execute(candidate.on_select, m_context);
@@ -476,12 +481,12 @@ auto& get_last(BufferRange& range) { return range.end; }
 
 bool InsertCompleter::has_candidate_selected() const
 {
-    return m_current_candidate >= 0 and m_current_candidate < m_completions.candidates.size() - 1;
+    return m_completions.is_valid() and m_current_candidate >= 0 and m_current_candidate < m_completions.candidates.size() - 1;
 }
 
 void InsertCompleter::try_accept()
 {
-    if (m_completions.is_valid() and has_candidate_selected())
+    if (has_candidate_selected())
         reset();
 }
 

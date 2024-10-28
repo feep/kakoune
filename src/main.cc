@@ -1,12 +1,13 @@
 #include "assert.hh"
 #include "backtrace.hh"
 #include "buffer.hh"
-#include "buffer_manager.hh"
 #include "buffer_utils.hh"
+#include "buffer_manager.hh"
 #include "client_manager.hh"
 #include "command_manager.hh"
 #include "commands.hh"
 #include "context.hh"
+#include "debug.hh"
 #include "event_manager.hh"
 #include "face_registry.hh"
 #include "file.hh"
@@ -27,7 +28,6 @@
 #include "string.hh"
 #include "unit_tests.hh"
 #include "window.hh"
-#include "clock.hh"
 
 #include <fcntl.h>
 #include <locale.h>
@@ -46,12 +46,25 @@ struct {
     StringView notes;
 } constexpr version_notes[] = { {
         0,
+        "» kak_* appearing in shell arguments will be added to the environment\n"
+        "» {+U}double underline{} support\n"
+        "» {+u}git apply{} can stage/revert selected changes to current buffer\n"
+    }, {
+        20240518,
+        "» Fix tests failing on some platforms\n"
+    }, {
+        20240509,
+        "» {+u}flag-lines -after{} highlighter\n"
         "» asynchronous {+u}shell-script-candidates{} completion\n"
-        "» {+b}%val{window_range}{} is now emitted as separate strings\n"
+        "» {+b}%val\\{window_range}{} is now emitted as separate strings\n"
         "» {+b}+{} only duplicates identical selections a single time\n"
         "» {+u}daemonize-session{} command\n"
         "» view mode and mouse scrolling no longer change selections\n"
-        "» {+u}git apply/edit/grep{} commands\n"
+        "» {+u}git apply/blame-jump/edit/grep{} commands\n"
+        "» {+u}git blame{} works in {+u}git-diff{} and {+u}git-log{} buffers\n"
+        "» custom completions are no longer sorted if the typed text is empty\n"
+        "» {+u}terminal{} now selects implementation based on windowing options\n"
+        "» {+u}local{} scopes\n"
     }, {
         20230805,
         "» Fix FreeBSD/MacOS clang compilation\n"
@@ -583,6 +596,7 @@ void register_options()
                        "    terminal_assistant             clippy|cat|dilbert|none|off\n"
                        "    terminal_status_on_top         bool\n"
                        "    terminal_set_title             bool\n"
+                       "    terminal_title                 str\n"
                        "    terminal_enable_mouse          bool\n"
                        "    terminal_synchronized          bool\n"
                        "    terminal_wheel_scroll_amount   int\n"
@@ -689,7 +703,8 @@ std::unique_ptr<UserInterface> create_local_ui(UIType ui_type)
 
     static SignalHandler old_handler = set_signal_handler(SIGTSTP, [](int sig) {
         if (ClientManager::instance().count() == 1 and
-            *ClientManager::instance().begin() == local_client)
+            *ClientManager::instance().begin() == local_client and
+            not Server::instance().is_daemon())
             old_handler(sig);
         else
         {
@@ -817,21 +832,28 @@ int run_server(StringView session, StringView server_init,
                                      "    {}", error.what()));
     }
 
+    {
+        Context empty_context{Context::EmptyContextFlag{}};
+        global_scope.hooks().run_hook(Hook::EnterDirectory, real_path("."), empty_context);
+        global_scope.hooks().run_hook(Hook::KakBegin, session, empty_context);
+    }
+
     if (not server_init.empty()) try
     {
         Context init_context{Context::EmptyContextFlag{}};
         command_manager.execute(server_init, init_context);
+    }
+    catch (const kill_session& kill)
+    {
+        Context empty_context{Context::EmptyContextFlag{}};
+        global_scope.hooks().run_hook(Hook::KakEnd, "", empty_context);
+        return kill.exit_status;
     }
     catch (runtime_error& error)
     {
         startup_error = true;
         write_to_debug_buffer(format("error while running server init commands:\n"
                                      "    {}", error.what()));
-    }
-
-    {
-        Context empty_context{Context::EmptyContextFlag{}};
-        global_scope.hooks().run_hook(Hook::KakBegin, session, empty_context);
     }
 
     if (not files.empty()) try
@@ -973,7 +995,7 @@ int run_filter(StringView keystr, ConstArrayView<StringView> files, bool quiet, 
                 };
 
                 for (auto& key : keys)
-                    input_handler.handle_key(key);
+                    input_handler.handle_key(key, true);
             }
             catch (runtime_error& err)
             {

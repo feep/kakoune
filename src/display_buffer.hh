@@ -7,7 +7,8 @@
 #include "string.hh"
 #include "vector.hh"
 #include "hash_map.hh"
-#include <functional>
+
+#include <algorithm>
 
 namespace Kakoune
 {
@@ -137,12 +138,13 @@ public:
     template<typename It>
     iterator insert(iterator pos, It beg, It end)
     {
-        auto has_buffer_range = std::mem_fn(&DisplayAtom::has_buffer_range);
+        auto has_buffer_range = [](const DisplayAtom& atom) { return atom.has_buffer_range(); };
+        auto had_range = any_of(*this, has_buffer_range);
         if (auto first = std::find_if(beg, end, has_buffer_range); first != end)
         {
             auto& last = *std::find_if(std::reverse_iterator(end), std::reverse_iterator(first), has_buffer_range);
-            m_range.begin = std::min(m_range.begin, first->begin());
-            m_range.end = std::max(m_range.end, last.end());
+            m_range.begin = had_range ? std::min(m_range.begin, (*first).begin()) : (*first).begin();
+            m_range.end = had_range ? std::max(m_range.end, last.end()) : last.end();
         }
         return m_atoms.insert(pos, beg, end);
     }
